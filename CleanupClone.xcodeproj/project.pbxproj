@@ -1,0 +1,544 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 63;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1F63B7A295931106E894F81C /* MainShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D972287A0D10201863327B1A /* MainShellView.swift */; };
+		22A9ECDB20CF4D6CAA2F95F8 /* FeatureScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69D6B743884A21C2F1D8D24C /* FeatureScreen.swift */; };
+		386FD0FCFB2F27321FD2AC71 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A04E0A85155C8BD3DC49737C /* RootView.swift */; };
+		3A723B5103EC4FCC8203648C /* GmailService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D52B13C14142319060C511 /* GmailService.swift */; };
+		4C175486010A1D6FEBF00F3B /* Typography.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8119EC82D4819BA7DBCDBF8C /* Typography.swift */; };
+		5DC096CB19764ABA118B0DAF /* CleanupTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = B33D2B360B2BE2A718671460 /* CleanupTheme.swift */; };
+		6F8F69B9CFF9DB2C59A5C73A /* SecretSpaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78B38B8E416541E9EEC710A4 /* SecretSpaceView.swift */; };
+		7C9F9185530FEB88472DCA90 /* PaywallView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0A43BC707DF163656EE45C /* PaywallView.swift */; };
+		84C04C9D746877D58628D29F /* ContactsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 014314BCADD0721C9BB66161 /* ContactsView.swift */; };
+		969DD9935B7EA224F6E4DD26 /* OnboardingFlowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D720B5E589ED5EA8DAB0094E /* OnboardingFlowView.swift */; };
+		9D18B8E236899D04DF33A523 /* ChargingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 120FD29F8551D78FE80DF4D8 /* ChargingView.swift */; };
+		A0F9C2030C29F5D1AFB91C11 /* MediaAnalysisStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0F9C2020C29F5D1AFB91C11 /* MediaAnalysisStore.swift */; };
+		A0F9C2050C29F844AFB91C11 /* PhotoAssetLookup.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0F9C2040C29F844AFB91C11 /* PhotoAssetLookup.swift */; };
+		A25496E2194A964CD620A9BD /* CompressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCABC7BEDB2792920751B0A5 /* CompressView.swift */; };
+		C919C0089541E790AEEA83C7 /* OnboardingStep.swift in Sources */ = {isa = PBXBuildFile; fileRef = 125434429FD1B13FC7E36995 /* OnboardingStep.swift */; };
+		CE83363D56E16F66905C9ADD /* EmailCleanerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77051B98F53E2D732738351D /* EmailCleanerView.swift */; };
+		D062AF08BB48E0781D4149B7 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 6B024A52CD0266F486C7CECB /* Assets.xcassets */; };
+		D4D33C7C69BA4DBAA5FCF2DE /* GoogleSignIn in Frameworks */ = {isa = PBXBuildFile; productRef = 601F211BCF554078B5F2E7D1 /* GoogleSignIn */; };
+		E0DEE659D781173A9A36ED84 /* CleanupCloneApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2E979F31B5D1A179A242F5C /* CleanupCloneApp.swift */; };
+		EA39833EB5A6EF87C78BF601 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6C482AEEAC411D5D1556FB3 /* DashboardView.swift */; };
+		FC67CAB3293A45CD9035C534 /* AppFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D1A296461561D27BFF0EAA4 /* AppFlow.swift */; };
+		FD53241676F9EF8010BA262A /* SharedComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32B1E033FE499696312C831A /* SharedComponents.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		014314BCADD0721C9BB66161 /* ContactsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactsView.swift; sourceTree = "<group>"; };
+		120FD29F8551D78FE80DF4D8 /* ChargingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChargingView.swift; sourceTree = "<group>"; };
+		125434429FD1B13FC7E36995 /* OnboardingStep.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingStep.swift; sourceTree = "<group>"; };
+		32B1E033FE499696312C831A /* SharedComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedComponents.swift; sourceTree = "<group>"; };
+		48D52B13C14142319060C511 /* GmailService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GmailService.swift; sourceTree = "<group>"; };
+		6172285609D6485C9F1170B0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		69D6B743884A21C2F1D8D24C /* FeatureScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeatureScreen.swift; sourceTree = "<group>"; };
+		6B024A52CD0266F486C7CECB /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		77051B98F53E2D732738351D /* EmailCleanerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmailCleanerView.swift; sourceTree = "<group>"; };
+		78B38B8E416541E9EEC710A4 /* SecretSpaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecretSpaceView.swift; sourceTree = "<group>"; };
+		8119EC82D4819BA7DBCDBF8C /* Typography.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Typography.swift; sourceTree = "<group>"; };
+		9D1A296461561D27BFF0EAA4 /* AppFlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppFlow.swift; sourceTree = "<group>"; };
+		A0F9C2020C29F5D1AFB91C11 /* MediaAnalysisStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaAnalysisStore.swift; sourceTree = "<group>"; };
+		A0F9C2040C29F844AFB91C11 /* PhotoAssetLookup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoAssetLookup.swift; sourceTree = "<group>"; };
+		A04E0A85155C8BD3DC49737C /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		A2E979F31B5D1A179A242F5C /* CleanupCloneApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CleanupCloneApp.swift; sourceTree = "<group>"; };
+		AA0A43BC707DF163656EE45C /* PaywallView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PaywallView.swift; sourceTree = "<group>"; };
+		B33D2B360B2BE2A718671460 /* CleanupTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CleanupTheme.swift; sourceTree = "<group>"; };
+		C6964B36A8064AF9E5810E44 /* CleanupClone.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CleanupClone.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		D720B5E589ED5EA8DAB0094E /* OnboardingFlowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingFlowView.swift; sourceTree = "<group>"; };
+		D972287A0D10201863327B1A /* MainShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainShellView.swift; sourceTree = "<group>"; };
+		DCABC7BEDB2792920751B0A5 /* CompressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompressView.swift; sourceTree = "<group>"; };
+		F6C482AEEAC411D5D1556FB3 /* DashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardView.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		9BA1A4892E334269890A136A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D4D33C7C69BA4DBAA5FCF2DE /* GoogleSignIn in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		07AA1DF17E8D5168C1CB5E0A /* SecretSpace */ = {
+			isa = PBXGroup;
+			children = (
+				78B38B8E416541E9EEC710A4 /* SecretSpaceView.swift */,
+			);
+			path = SecretSpace;
+			sourceTree = "<group>";
+		};
+		0D9069DF6F3AE66C55A8D148 /* Compress */ = {
+			isa = PBXGroup;
+			children = (
+				DCABC7BEDB2792920751B0A5 /* CompressView.swift */,
+			);
+			path = Compress;
+			sourceTree = "<group>";
+		};
+		10DE694B9CEC89B753B501B8 /* DesignSystem */ = {
+			isa = PBXGroup;
+			children = (
+				B33D2B360B2BE2A718671460 /* CleanupTheme.swift */,
+				32B1E033FE499696312C831A /* SharedComponents.swift */,
+				8119EC82D4819BA7DBCDBF8C /* Typography.swift */,
+			);
+			path = DesignSystem;
+			sourceTree = "<group>";
+		};
+		1355F6B9A1C8AE30EDB1B78E /* CleanupClone */ = {
+			isa = PBXGroup;
+			children = (
+				6B024A52CD0266F486C7CECB /* Assets.xcassets */,
+				57E9CC6969721728E29C5731 /* App */,
+				A99A6AE936F5A4D2CCC15F08 /* Core */,
+				10DE694B9CEC89B753B501B8 /* DesignSystem */,
+				50262D4F21AF89247C19FB96 /* Features */,
+			);
+			path = CleanupClone;
+			sourceTree = "<group>";
+		};
+		19A4F961AD579C2B870B3F02 /* EmailCleaner */ = {
+			isa = PBXGroup;
+			children = (
+				77051B98F53E2D732738351D /* EmailCleanerView.swift */,
+			);
+			path = EmailCleaner;
+			sourceTree = "<group>";
+		};
+		1C108EE89D7B9471E78E47A3 /* Dashboard */ = {
+			isa = PBXGroup;
+			children = (
+				F6C482AEEAC411D5D1556FB3 /* DashboardView.swift */,
+				D972287A0D10201863327B1A /* MainShellView.swift */,
+			);
+			path = Dashboard;
+			sourceTree = "<group>";
+		};
+		2F034BA116D494D36592868D /* Settings */ = {
+			isa = PBXGroup;
+			children = (
+				69D6B743884A21C2F1D8D24C /* FeatureScreen.swift */,
+			);
+			path = Settings;
+			sourceTree = "<group>";
+		};
+		3D96818DEF2CC290B9424B6F /* Paywall */ = {
+			isa = PBXGroup;
+			children = (
+				AA0A43BC707DF163656EE45C /* PaywallView.swift */,
+			);
+			path = Paywall;
+			sourceTree = "<group>";
+		};
+		50262D4F21AF89247C19FB96 /* Features */ = {
+			isa = PBXGroup;
+			children = (
+				E2AB653DD241902BBBB8A07D /* Charging */,
+				0D9069DF6F3AE66C55A8D148 /* Compress */,
+				DAE64ACD39B6340A6EAB3010 /* Contacts */,
+				1C108EE89D7B9471E78E47A3 /* Dashboard */,
+				19A4F961AD579C2B870B3F02 /* EmailCleaner */,
+				7DC487AB7EAA866F16EA93A4 /* Onboarding */,
+				3D96818DEF2CC290B9424B6F /* Paywall */,
+				07AA1DF17E8D5168C1CB5E0A /* SecretSpace */,
+				2F034BA116D494D36592868D /* Settings */,
+			);
+			path = Features;
+			sourceTree = "<group>";
+		};
+		57E9CC6969721728E29C5731 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				A2E979F31B5D1A179A242F5C /* CleanupCloneApp.swift */,
+				A04E0A85155C8BD3DC49737C /* RootView.swift */,
+				8876DE84E67C4108A278B52E /* Support */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		61853DAC32C77153375664B8 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				C6964B36A8064AF9E5810E44 /* CleanupClone.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		7DC487AB7EAA866F16EA93A4 /* Onboarding */ = {
+			isa = PBXGroup;
+			children = (
+				D720B5E589ED5EA8DAB0094E /* OnboardingFlowView.swift */,
+				125434429FD1B13FC7E36995 /* OnboardingStep.swift */,
+			);
+			path = Onboarding;
+			sourceTree = "<group>";
+		};
+		8876DE84E67C4108A278B52E /* Support */ = {
+			isa = PBXGroup;
+			children = (
+				6172285609D6485C9F1170B0 /* Info.plist */,
+			);
+			path = Support;
+			sourceTree = "<group>";
+		};
+		A99A6AE936F5A4D2CCC15F08 /* Core */ = {
+			isa = PBXGroup;
+			children = (
+				9D1A296461561D27BFF0EAA4 /* AppFlow.swift */,
+				48D52B13C14142319060C511 /* GmailService.swift */,
+				A0F9C2020C29F5D1AFB91C11 /* MediaAnalysisStore.swift */,
+				A0F9C2040C29F844AFB91C11 /* PhotoAssetLookup.swift */,
+			);
+			path = Core;
+			sourceTree = "<group>";
+		};
+		BE39DD0E23D5FD01D4BAFCBF = {
+			isa = PBXGroup;
+			children = (
+				1355F6B9A1C8AE30EDB1B78E /* CleanupClone */,
+				61853DAC32C77153375664B8 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		DAE64ACD39B6340A6EAB3010 /* Contacts */ = {
+			isa = PBXGroup;
+			children = (
+				014314BCADD0721C9BB66161 /* ContactsView.swift */,
+			);
+			path = Contacts;
+			sourceTree = "<group>";
+		};
+		E2AB653DD241902BBBB8A07D /* Charging */ = {
+			isa = PBXGroup;
+			children = (
+				120FD29F8551D78FE80DF4D8 /* ChargingView.swift */,
+			);
+			path = Charging;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A433DCD8F8ED4995AD2B7938 /* CleanupClone */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F349969AD35A59A8548542BA /* Build configuration list for PBXNativeTarget "CleanupClone" */;
+			buildPhases = (
+				C77BC26B75254A333D8D57FC /* Sources */,
+				9BA1A4892E334269890A136A /* Frameworks */,
+				6E59F7BFAF2671390CBF6485 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CleanupClone;
+			packageProductDependencies = (
+				601F211BCF554078B5F2E7D1 /* GoogleSignIn */,
+			);
+			productName = CleanupClone;
+			productReference = C6964B36A8064AF9E5810E44 /* CleanupClone.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		3790F64184E53566EBF36D99 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+			};
+			buildConfigurationList = C16027719054AAD2249F93EB /* Build configuration list for PBXProject "CleanupClone" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = BE39DD0E23D5FD01D4BAFCBF;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				18A130A418A547C399828947 /* XCRemoteSwiftPackageReference "GoogleSignIn-iOS" */,
+			);
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A433DCD8F8ED4995AD2B7938 /* CleanupClone */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		6E59F7BFAF2671390CBF6485 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D062AF08BB48E0781D4149B7 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		C77BC26B75254A333D8D57FC /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FC67CAB3293A45CD9035C534 /* AppFlow.swift in Sources */,
+				A0F9C2030C29F5D1AFB91C11 /* MediaAnalysisStore.swift in Sources */,
+				A0F9C2050C29F844AFB91C11 /* PhotoAssetLookup.swift in Sources */,
+				9D18B8E236899D04DF33A523 /* ChargingView.swift in Sources */,
+				E0DEE659D781173A9A36ED84 /* CleanupCloneApp.swift in Sources */,
+				5DC096CB19764ABA118B0DAF /* CleanupTheme.swift in Sources */,
+				A25496E2194A964CD620A9BD /* CompressView.swift in Sources */,
+				84C04C9D746877D58628D29F /* ContactsView.swift in Sources */,
+				EA39833EB5A6EF87C78BF601 /* DashboardView.swift in Sources */,
+				CE83363D56E16F66905C9ADD /* EmailCleanerView.swift in Sources */,
+				22A9ECDB20CF4D6CAA2F95F8 /* FeatureScreen.swift in Sources */,
+				3A723B5103EC4FCC8203648C /* GmailService.swift in Sources */,
+				1F63B7A295931106E894F81C /* MainShellView.swift in Sources */,
+				969DD9935B7EA224F6E4DD26 /* OnboardingFlowView.swift in Sources */,
+				C919C0089541E790AEEA83C7 /* OnboardingStep.swift in Sources */,
+				7C9F9185530FEB88472DCA90 /* PaywallView.swift in Sources */,
+				386FD0FCFB2F27321FD2AC71 /* RootView.swift in Sources */,
+				6F8F69B9CFF9DB2C59A5C73A /* SecretSpaceView.swift in Sources */,
+				FD53241676F9EF8010BA262A /* SharedComponents.swift in Sources */,
+				4C175486010A1D6FEBF00F3B /* Typography.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		2A5752949B53E23F05BE6CB4 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_ASSET_PATHS = "\"CleanupClone/Assets.xcassets\"";
+				DEVELOPMENT_TEAM = P9J5D8KGS2;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = CleanupClone/App/Support/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.sanjana.cleanupclone;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		40AACD5B9B3B493ADD872850 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Cleanup;
+				INFOPLIST_KEY_NSContactsUsageDescription = "Cleanup needs access to your contacts to find and merge duplicates.";
+				INFOPLIST_KEY_NSFaceIDUsageDescription = "Use Face ID to unlock your Secret Space faster.";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Cleanup needs permission to save compressed exports and private vault media.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Cleanup needs access to your photos to detect duplicates, screenshots, and large media.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = CleanupClone;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		4DEB65AA8CBC5F2CCD3B3CBE /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_ASSET_PATHS = "\"CleanupClone/Assets.xcassets\"";
+				DEVELOPMENT_TEAM = P9J5D8KGS2;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = CleanupClone/App/Support/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.sanjana.cleanupclone;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		9F7B13B9CB3AAF55937F70D5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Cleanup;
+				INFOPLIST_KEY_NSContactsUsageDescription = "Cleanup needs access to your contacts to find and merge duplicates.";
+				INFOPLIST_KEY_NSFaceIDUsageDescription = "Use Face ID to unlock your Secret Space faster.";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Cleanup needs permission to save compressed exports and private vault media.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Cleanup needs access to your photos to detect duplicates, screenshots, and large media.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = CleanupClone;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		C16027719054AAD2249F93EB /* Build configuration list for PBXProject "CleanupClone" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				40AACD5B9B3B493ADD872850 /* Debug */,
+				9F7B13B9CB3AAF55937F70D5 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		F349969AD35A59A8548542BA /* Build configuration list for PBXNativeTarget "CleanupClone" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4DEB65AA8CBC5F2CCD3B3CBE /* Debug */,
+				2A5752949B53E23F05BE6CB4 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		18A130A418A547C399828947 /* XCRemoteSwiftPackageReference "GoogleSignIn-iOS" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/google/GoogleSignIn-iOS.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 9.1.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		601F211BCF554078B5F2E7D1 /* GoogleSignIn */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 18A130A418A547C399828947 /* XCRemoteSwiftPackageReference "GoogleSignIn-iOS" */;
+			productName = GoogleSignIn;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 3790F64184E53566EBF36D99 /* Project object */;
+}

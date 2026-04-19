@@ -1,0 +1,16 @@
+.DS_Store
+
+# Xcode user/build data
+DerivedData/
+.deriveddata/
+.deriveddata-sim/
+build/
+*.xcuserstate
+xcuserdata/
+
+# Swift Package Manager
+.build/
+
+# Local outputs
+output/
+tmp/
