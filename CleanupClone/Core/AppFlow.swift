@@ -434,7 +434,7 @@ struct MediaCompressionResult: Hashable {
 }
 
 enum MediaWorkQueues {
-    private static let indexingConcurrencyLimit = max(1, ProcessInfo.processInfo.activeProcessorCount / 2)
+    private static let indexingConcurrencyLimit = max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
 
     static let indexingQueue = DispatchQueue(
         label: "com.cleanupclone.media.indexing",
@@ -2174,6 +2174,8 @@ final class AppFlow: ObservableObject {
         }
     }
 
+    /// Fetch a small 256×256 thumbnail for indexing. This is I/O-bound work
+    /// so it does NOT hold the indexing semaphore — only Vision compute should.
     nonisolated private static func requestIndexingThumbnail(for asset: PHAsset) async -> IndexingThumbnail? {
         let options = PHImageRequestOptions()
         options.deliveryMode = .fastFormat
@@ -2183,30 +2185,26 @@ final class AppFlow: ObservableObject {
         options.version = .current
 
         return await withCheckedContinuation { continuation in
-            MediaWorkQueues.indexingQueue.async {
-                MediaWorkQueues.indexingSemaphore.wait()
-                var didResume = false
+            var didResume = false
 
-                _ = indexingImageManager.requestImage(
-                    for: asset,
-                    targetSize: indexingTargetSize,
-                    contentMode: .aspectFit,
-                    options: options
-                ) { image, info in
-                    let isCancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
-                    let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            indexingImageManager.requestImage(
+                for: asset,
+                targetSize: indexingTargetSize,
+                contentMode: .aspectFit,
+                options: options
+            ) { image, info in
+                let isCancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
+                let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
 
-                    guard !didResume, isCancelled || !isDegraded else { return }
-                    didResume = true
-                    MediaWorkQueues.indexingSemaphore.signal()
+                guard !didResume, isCancelled || !isDegraded else { return }
+                didResume = true
 
-                    guard let image, let ciImage = ciImage(from: image) else {
-                        continuation.resume(returning: nil)
-                        return
-                    }
-
-                    continuation.resume(returning: IndexingThumbnail(uiImage: image, ciImage: ciImage))
+                guard let image, let ciImage = ciImage(from: image) else {
+                    continuation.resume(returning: nil)
+                    return
                 }
+
+                continuation.resume(returning: IndexingThumbnail(uiImage: image, ciImage: ciImage))
             }
         }
     }
