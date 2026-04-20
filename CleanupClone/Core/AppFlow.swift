@@ -2580,12 +2580,46 @@ final class AppFlow: ObservableObject {
 
     private func isScreenRecordingAsset(_ asset: PHAsset) -> Bool {
         guard asset.mediaType == .video else { return false }
+        // Cheap pre-filter: screen recordings are captured at the device's
+        // native screen resolution, portrait-oriented, and don't come from
+        // the camera. Everything that fails this is definitely not a screen
+        // recording, so we skip the expensive PHAssetResource lookup (which
+        // triggers a main-queue PHAssetOriginalMetadataProperties fetch and
+        // spams the log at scan time).
+        guard asset.pixelHeight >= asset.pixelWidth else { return false }
+        guard isLikelyScreenResolution(width: asset.pixelWidth, height: asset.pixelHeight) else {
+            return false
+        }
         let resources = PHAssetResource.assetResources(for: asset)
         guard let filename = resources.first?.originalFilename else { return false }
         let lower = filename.lowercased()
         return lower.hasPrefix("rpreplay")
             || lower.hasPrefix("screen recording")
             || lower.hasPrefix("screenrecording")
+    }
+
+    private func isLikelyScreenResolution(width: Int, height: Int) -> Bool {
+        // Known iPhone/iPad screen-recording output resolutions (portrait).
+        // Screen recordings use device-native pixels; camera clips do not.
+        let known: Set<Int> = [
+            // iPhone SE / 8 / 7 / 6s
+            568, 667, 736, 812,
+            // iPhone X / XS / 11 Pro / 12 mini / 13 mini
+            844, 852, 896,
+            // iPhone 11 / XR
+            1624,
+            // iPhone 12 / 13 / 14 / 15
+            1170, 2532,
+            // iPhone 14 Pro / 15 Pro / 16
+            1179, 2556,
+            // iPhone 14 Pro Max / 15 Pro Max / 16 Pro Max
+            1290, 2796,
+            // iPhone 16 Pro
+            1206, 2622,
+            // iPad common
+            1620, 2160, 1668, 2224, 2388, 2732
+        ]
+        return known.contains(width) || known.contains(height)
     }
 
     private func mediaDisplayTitle(for asset: PHAsset) -> String {

@@ -286,11 +286,15 @@ final class GmailService {
 
     private func fetchTopSenders(accessToken: String) async throws -> [GmailSenderSummary] {
         var groupedSenders: [String: SenderAccumulator] = [:]
-        // Sample up to 500 messages per category label across multiple pages
-        // so we find the long tail of recurring senders, not just the top 8.
-        let samplesPerLabel = 500
+        // Sample enough to find recurring senders without tripping Gmail's
+        // per-user concurrency/QPS limit (HTTP 429 rateLimitExceeded).
+        // 150 messages per category × 4 categories = 600 metadata calls.
+        let samplesPerLabel = 150
         let pageSize = 100
 
+        // Fetch message IDs in sequence per label (cheap call, only one page
+        // per label in most cases) but overlap the 4 labels in parallel.
+        var allMessages: [GmailMessageIdentifier] = []
         try await withThrowingTaskGroup(of: [GmailMessageIdentifier].self) { group in
             for labelID in Self.senderSamplingLabels {
                 group.addTask {
@@ -313,38 +317,55 @@ final class GmailService {
                     return collected
                 }
             }
+            for try await list in group {
+                allMessages.append(contentsOf: list)
+            }
+        }
 
-            for try await messages in group {
-                // Fetch metadata in parallel batches for speed.
-                try await withThrowingTaskGroup(of: (ParsedSender?, (httpURL: URL?, mailto: URL?, oneClick: Bool)).self) { metaGroup in
-                    for message in messages {
-                        metaGroup.addTask {
-                            let metadata = try await self.fetchMessageMetadata(
-                                accessToken: accessToken,
-                                messageID: message.id
-                            )
-                            let sender = self.parseSender(from: metadata.payload.headers)
-                            let parsed = self.parseAllUnsubscribe(from: metadata.payload.headers)
-                            return (sender, parsed)
-                        }
+        // Dedupe on message id in case the same message shows up in two labels.
+        var seen = Set<String>()
+        let uniqueMessages = allMessages.filter { seen.insert($0.id).inserted }
+
+        // Metadata fanout with a hard concurrency cap of 8 simultaneous
+        // requests — stays well under Gmail's per-user limit.
+        let concurrency = 8
+        try await withThrowingTaskGroup(of: (ParsedSender?, (httpURL: URL?, mailto: URL?, oneClick: Bool))?.self) { metaGroup in
+            var index = 0
+            // Prime the first `concurrency` tasks.
+            while index < min(concurrency, uniqueMessages.count) {
+                let message = uniqueMessages[index]
+                metaGroup.addTask { [weak self] in
+                    guard let self else { return nil }
+                    return try await self.fetchSenderAndUnsubscribe(accessToken: accessToken, messageID: message.id)
+                }
+                index += 1
+            }
+            // As each finishes, schedule the next one.
+            while let result = try await metaGroup.next() {
+                if let tuple = result, let sender = tuple.0 {
+                    let parsed = tuple.1
+                    var accumulator = groupedSenders[sender.email.lowercased()] ?? SenderAccumulator(
+                        name: sender.name,
+                        email: sender.email,
+                        sampleCount: 0,
+                        unsubscribeURL: nil,
+                        supportsOneClickPost: false,
+                        mailtoUnsubscribe: nil
+                    )
+                    accumulator.sampleCount += 1
+                    accumulator.name = sender.name
+                    accumulator.unsubscribeURL = accumulator.unsubscribeURL ?? parsed.httpURL
+                    accumulator.mailtoUnsubscribe = accumulator.mailtoUnsubscribe ?? parsed.mailto
+                    accumulator.supportsOneClickPost = accumulator.supportsOneClickPost || parsed.oneClick
+                    groupedSenders[sender.email.lowercased()] = accumulator
+                }
+                if index < uniqueMessages.count {
+                    let message = uniqueMessages[index]
+                    metaGroup.addTask { [weak self] in
+                        guard let self else { return nil }
+                        return try await self.fetchSenderAndUnsubscribe(accessToken: accessToken, messageID: message.id)
                     }
-                    for try await (sender, parsed) in metaGroup {
-                        guard let sender else { continue }
-                        var accumulator = groupedSenders[sender.email.lowercased()] ?? SenderAccumulator(
-                            name: sender.name,
-                            email: sender.email,
-                            sampleCount: 0,
-                            unsubscribeURL: nil,
-                            supportsOneClickPost: false,
-                            mailtoUnsubscribe: nil
-                        )
-                        accumulator.sampleCount += 1
-                        accumulator.name = sender.name
-                        accumulator.unsubscribeURL = accumulator.unsubscribeURL ?? parsed.httpURL
-                        accumulator.mailtoUnsubscribe = accumulator.mailtoUnsubscribe ?? parsed.mailto
-                        accumulator.supportsOneClickPost = accumulator.supportsOneClickPost || parsed.oneClick
-                        groupedSenders[sender.email.lowercased()] = accumulator
-                    }
+                    index += 1
                 }
             }
         }
@@ -388,6 +409,16 @@ final class GmailService {
             }
             return $0.emailCount > $1.emailCount
         }
+    }
+
+    private func fetchSenderAndUnsubscribe(
+        accessToken: String,
+        messageID: String
+    ) async throws -> (ParsedSender?, (httpURL: URL?, mailto: URL?, oneClick: Bool))? {
+        let metadata = try await fetchMessageMetadata(accessToken: accessToken, messageID: messageID)
+        let sender = parseSender(from: metadata.payload.headers)
+        let parsed = parseAllUnsubscribe(from: metadata.payload.headers)
+        return (sender, parsed)
     }
 
     private func fetchMessageMetadata(accessToken: String, messageID: String) async throws -> GmailMessageMetadataResponse {
@@ -729,18 +760,40 @@ final class GmailService {
         var request = URLRequest(url: components.url!)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
 
-        let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw GmailServiceError.invalidResponse
+        // Retry on 429 / 503 with exponential backoff so we don't bubble up
+        // a transient rate-limit error to the UI on the first hiccup.
+        var lastError: Error?
+        for attempt in 0..<4 {
+            do {
+                let (data, response) = try await session.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw GmailServiceError.invalidResponse
+                }
+                if httpResponse.statusCode == 429 || httpResponse.statusCode == 503 {
+                    let delayNs = UInt64(pow(2.0, Double(attempt)) * 500_000_000)
+                    try? await Task.sleep(nanoseconds: delayNs)
+                    lastError = NSError(domain: "GmailService", code: httpResponse.statusCode, userInfo: [
+                        NSLocalizedDescriptionKey: String(data: data, encoding: .utf8) ?? "Rate limit"
+                    ])
+                    continue
+                }
+                guard (200 ..< 300).contains(httpResponse.statusCode) else {
+                    let message = String(data: data, encoding: .utf8) ?? "Unknown Google API error"
+                    throw NSError(domain: "GmailService", code: httpResponse.statusCode, userInfo: [
+                        NSLocalizedDescriptionKey: message
+                    ])
+                }
+                return try JSONDecoder().decode(Response.self, from: data)
+            } catch {
+                lastError = error
+                let nsError = error as NSError
+                if nsError.domain == "GmailService", nsError.code == 429 || nsError.code == 503 {
+                    continue
+                }
+                throw error
+            }
         }
-        guard (200 ..< 300).contains(httpResponse.statusCode) else {
-            let message = String(data: data, encoding: .utf8) ?? "Unknown Google API error"
-            throw NSError(domain: "GmailService", code: httpResponse.statusCode, userInfo: [
-                NSLocalizedDescriptionKey: message
-            ])
-        }
-
-        return try JSONDecoder().decode(Response.self, from: data)
+        throw lastError ?? GmailServiceError.invalidResponse
     }
 
     nonisolated private func parseSender(from headers: [GmailHeader]) -> ParsedSender? {
