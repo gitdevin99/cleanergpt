@@ -1509,7 +1509,7 @@ struct MediaCategoryReviewView: View {
                     dragSelect.cellFrames = frames
                 }
                 .modifier(DragSelectGestureModifier(
-                    enabled: !flatGalleryIsVideo,
+                    enabled: true,
                     coordinateSpace: "screenshotGrid",
                     dragSelect: dragSelect,
                     assets: assets,
@@ -1517,7 +1517,7 @@ struct MediaCategoryReviewView: View {
                 ))
                 .padding(.bottom, 120)
             }
-            .scrollDisabled(!flatGalleryIsVideo && dragSelect.isDragging)
+            .scrollDisabled(dragSelect.isDragging)
 
             screenshotDeleteBar
         }
@@ -2881,23 +2881,33 @@ private struct DragSelectGestureModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         if enabled {
-            content.simultaneousGesture(
-                DragGesture(minimumDistance: 12, coordinateSpace: .named(coordinateSpace))
-                    .onChanged { value in
+            // Long-press-then-drag: a quick vertical swipe still scrolls,
+            // but press & hold (~0.25s) enters drag-select mode and every
+            // cell the finger passes over is toggled in sync with the
+            // anchor's initial state (Photos-style). Haptic on enter.
+            let gesture = LongPressGesture(minimumDuration: 0.22)
+                .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named(coordinateSpace)))
+                .onChanged { value in
+                    switch value {
+                    case .second(true, let drag?):
                         if !dragSelect.isDragging {
                             dragSelect.orderedIDs = assets.map(\.id)
-                            dragSelect.dragBegan(at: value.startLocation, currentSelection: selectedAssetIDs)
+                            dragSelect.dragBegan(at: drag.startLocation, currentSelection: selectedAssetIDs)
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                         }
-                        if let newSelection = dragSelect.dragMoved(to: value.location) {
+                        if let newSelection = dragSelect.dragMoved(to: drag.location) {
                             selectedAssetIDs = newSelection
                         }
+                    default:
+                        break
                     }
-                    .onEnded { _ in
-                        if let finalSelection = dragSelect.dragEnded() {
-                            selectedAssetIDs = finalSelection
-                        }
+                }
+                .onEnded { _ in
+                    if let finalSelection = dragSelect.dragEnded() {
+                        selectedAssetIDs = finalSelection
                     }
-            )
+                }
+            content.simultaneousGesture(gesture)
         } else {
             content
         }
