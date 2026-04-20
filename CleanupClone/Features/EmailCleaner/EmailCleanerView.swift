@@ -252,10 +252,13 @@ struct EmailCleanerView: View {
 
             ScrollView(showsIndicators: false) {
                 LazyVStack(spacing: 8) {
-                    ForEach(currentCategoryMessages) { message in
+                    ForEach(Array(currentCategoryMessages.enumerated()), id: \.element.id) { index, message in
                         messageRow(message)
                             .onAppear {
-                                if message.id == currentCategoryMessages.last?.id, currentCategoryNextPage != nil {
+                                // Trigger ~10 rows before the end so the next
+                                // page is warm by the time the user reaches it.
+                                let threshold = max(currentCategoryMessages.count - 10, 0)
+                                if index >= threshold, currentCategoryNextPage != nil, !isLoadingCategoryPage {
                                     Task { await loadNextCategoryPage() }
                                 }
                             }
@@ -268,6 +271,25 @@ struct EmailCleanerView: View {
                             Spacer()
                         }
                         .padding(.vertical, 16)
+                    } else if currentCategoryNextPage != nil {
+                        Button {
+                            Task { await loadNextCategoryPage() }
+                        } label: {
+                            Text("Load more")
+                                .font(CleanupFont.body(14))
+                                .foregroundStyle(CleanupTheme.electricBlue)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .background(RoundedRectangle(cornerRadius: 14).strokeBorder(CleanupTheme.electricBlue.opacity(0.4)))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 8)
+                    } else if !currentCategoryMessages.isEmpty {
+                        Text("All \(currentCategoryMessages.count) loaded")
+                            .font(CleanupFont.caption(12))
+                            .foregroundStyle(CleanupTheme.textTertiary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 16)
                     }
                 }
                 .padding(.bottom, 80)

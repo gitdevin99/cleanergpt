@@ -246,73 +246,105 @@ final class GmailService {
     }
 
     private func fetchCategories(accessToken: String) async throws -> [GmailCategorySummary] {
-        let response: GmailLabelListResponse = try await request(
-            path: "users/me/labels",
-            accessToken: accessToken
-        )
-
-        let labelsByID = Dictionary(uniqueKeysWithValues: response.labels.map { ($0.id, $0) })
-        let definitions: [(String, String, String)] = [
-            ("Social", "Social Media", "CATEGORY_SOCIAL"),
-            ("Promotions", "Promotions", "CATEGORY_PROMOTIONS"),
-            ("Updates", "Updates", "CATEGORY_UPDATES"),
-            ("Newsletters", "Forum", "CATEGORY_FORUMS"),
-            ("Notifications", "Spam", "SPAM")
+        // Gmail's users.labels.list returns messagesTotal == 0 for CATEGORY_*
+        // labels because Gmail treats categories as virtual filters on INBOX,
+        // not as storage labels. Use search queries with resultSizeEstimate
+        // instead — that's the same number the Gmail web UI shows.
+        let definitions: [(id: String, title: String, labelID: String, query: String)] = [
+            ("Social", "Social Media", "CATEGORY_SOCIAL", "category:social"),
+            ("Promotions", "Promotions", "CATEGORY_PROMOTIONS", "category:promotions"),
+            ("Updates", "Updates", "CATEGORY_UPDATES", "category:updates"),
+            ("Newsletters", "Forum", "CATEGORY_FORUMS", "category:forums"),
+            ("Notifications", "Spam", "SPAM", "in:spam")
         ]
 
-        return definitions.map { id, title, labelID in
-            GmailCategorySummary(
-                id: id,
-                title: title,
-                labelID: labelID,
-                messageCount: labelsByID[labelID]?.messagesTotal ?? 0
-            )
-        }
-    }
-
-    private func fetchTopSenders(accessToken: String) async throws -> [GmailSenderSummary] {
-        var groupedSenders: [String: SenderAccumulator] = [:]
-
-        try await withThrowingTaskGroup(of: [GmailMessageIdentifier].self) { group in
-            for labelID in Self.senderSamplingLabels {
+        return try await withThrowingTaskGroup(of: (Int, GmailCategorySummary).self) { group in
+            for (index, def) in definitions.enumerated() {
                 group.addTask {
                     let response: GmailMessageListResponse = try await self.request(
                         path: "users/me/messages",
                         accessToken: accessToken,
                         queryItems: [
-                            URLQueryItem(name: "labelIds", value: labelID),
-                            URLQueryItem(name: "maxResults", value: "20")
+                            URLQueryItem(name: "q", value: def.query),
+                            URLQueryItem(name: "maxResults", value: "1")
                         ]
                     )
-                    return response.messages ?? []
+                    let summary = GmailCategorySummary(
+                        id: def.id,
+                        title: def.title,
+                        labelID: def.labelID,
+                        messageCount: response.resultSizeEstimate ?? 0
+                    )
+                    return (index, summary)
+                }
+            }
+            var results: [(Int, GmailCategorySummary)] = []
+            for try await pair in group { results.append(pair) }
+            return results.sorted { $0.0 < $1.0 }.map { $0.1 }
+        }
+    }
+
+    private func fetchTopSenders(accessToken: String) async throws -> [GmailSenderSummary] {
+        var groupedSenders: [String: SenderAccumulator] = [:]
+        // Sample up to 500 messages per category label across multiple pages
+        // so we find the long tail of recurring senders, not just the top 8.
+        let samplesPerLabel = 500
+        let pageSize = 100
+
+        try await withThrowingTaskGroup(of: [GmailMessageIdentifier].self) { group in
+            for labelID in Self.senderSamplingLabels {
+                group.addTask {
+                    var collected: [GmailMessageIdentifier] = []
+                    var pageToken: String?
+                    repeat {
+                        var queryItems: [URLQueryItem] = [
+                            URLQueryItem(name: "labelIds", value: labelID),
+                            URLQueryItem(name: "maxResults", value: String(pageSize))
+                        ]
+                        if let pageToken { queryItems.append(URLQueryItem(name: "pageToken", value: pageToken)) }
+                        let response: GmailMessageListResponse = try await self.request(
+                            path: "users/me/messages",
+                            accessToken: accessToken,
+                            queryItems: queryItems
+                        )
+                        collected.append(contentsOf: response.messages ?? [])
+                        pageToken = response.nextPageToken
+                    } while pageToken != nil && collected.count < samplesPerLabel
+                    return collected
                 }
             }
 
             for try await messages in group {
-                for message in messages {
-                    let metadata = try await fetchMessageMetadata(
-                        accessToken: accessToken,
-                        messageID: message.id
-                    )
-                    guard let sender = parseSender(from: metadata.payload.headers) else {
-                        continue
+                // Fetch metadata in parallel batches for speed.
+                try await withThrowingTaskGroup(of: (ParsedSender?, (httpURL: URL?, mailto: URL?, oneClick: Bool)).self) { metaGroup in
+                    for message in messages {
+                        metaGroup.addTask {
+                            let metadata = try await self.fetchMessageMetadata(
+                                accessToken: accessToken,
+                                messageID: message.id
+                            )
+                            let sender = self.parseSender(from: metadata.payload.headers)
+                            let parsed = self.parseAllUnsubscribe(from: metadata.payload.headers)
+                            return (sender, parsed)
+                        }
                     }
-
-                    var accumulator = groupedSenders[sender.email.lowercased()] ?? SenderAccumulator(
-                        name: sender.name,
-                        email: sender.email,
-                        sampleCount: 0,
-                        unsubscribeURL: nil,
-                        supportsOneClickPost: false,
-                        mailtoUnsubscribe: nil
-                    )
-                    accumulator.sampleCount += 1
-                    accumulator.name = sender.name
-                    let parsed = parseAllUnsubscribe(from: metadata.payload.headers)
-                    accumulator.unsubscribeURL = accumulator.unsubscribeURL ?? parsed.httpURL
-                    accumulator.mailtoUnsubscribe = accumulator.mailtoUnsubscribe ?? parsed.mailto
-                    accumulator.supportsOneClickPost = accumulator.supportsOneClickPost || parsed.oneClick
-                    groupedSenders[sender.email.lowercased()] = accumulator
+                    for try await (sender, parsed) in metaGroup {
+                        guard let sender else { continue }
+                        var accumulator = groupedSenders[sender.email.lowercased()] ?? SenderAccumulator(
+                            name: sender.name,
+                            email: sender.email,
+                            sampleCount: 0,
+                            unsubscribeURL: nil,
+                            supportsOneClickPost: false,
+                            mailtoUnsubscribe: nil
+                        )
+                        accumulator.sampleCount += 1
+                        accumulator.name = sender.name
+                        accumulator.unsubscribeURL = accumulator.unsubscribeURL ?? parsed.httpURL
+                        accumulator.mailtoUnsubscribe = accumulator.mailtoUnsubscribe ?? parsed.mailto
+                        accumulator.supportsOneClickPost = accumulator.supportsOneClickPost || parsed.oneClick
+                        groupedSenders[sender.email.lowercased()] = accumulator
+                    }
                 }
             }
         }
@@ -324,7 +356,7 @@ final class GmailService {
                 }
                 return lhs.sampleCount > rhs.sampleCount
             }
-            .prefix(8)
+            .prefix(50)
 
         var resolved: [GmailSenderSummary] = []
         for candidate in candidates {
@@ -711,7 +743,7 @@ final class GmailService {
         return try JSONDecoder().decode(Response.self, from: data)
     }
 
-    private func parseSender(from headers: [GmailHeader]) -> ParsedSender? {
+    nonisolated private func parseSender(from headers: [GmailHeader]) -> ParsedSender? {
         guard let rawValue = headers.first(where: { $0.name.caseInsensitiveCompare("From") == .orderedSame })?.value else {
             return nil
         }
@@ -726,11 +758,11 @@ final class GmailService {
         return email.contains("@") ? ParsedSender(name: email.components(separatedBy: "@").first ?? email, email: email) : nil
     }
 
-    private func parseUnsubscribeURL(from headers: [GmailHeader]) -> URL? {
+    nonisolated private func parseUnsubscribeURL(from headers: [GmailHeader]) -> URL? {
         parseAllUnsubscribe(from: headers).httpURL ?? parseAllUnsubscribe(from: headers).mailto
     }
 
-    private func parseAllUnsubscribe(from headers: [GmailHeader]) -> (httpURL: URL?, mailto: URL?, oneClick: Bool) {
+    nonisolated private func parseAllUnsubscribe(from headers: [GmailHeader]) -> (httpURL: URL?, mailto: URL?, oneClick: Bool) {
         let rawValue = headers.first { $0.name.caseInsensitiveCompare("List-Unsubscribe") == .orderedSame }?.value
         let postHeader = headers.first { $0.name.caseInsensitiveCompare("List-Unsubscribe-Post") == .orderedSame }?.value
         let oneClick = (postHeader ?? "").lowercased().contains("one-click")
@@ -760,18 +792,9 @@ private struct SenderAccumulator {
     var mailtoUnsubscribe: URL?
 }
 
-private struct ParsedSender {
+private struct ParsedSender: Sendable {
     let name: String
     let email: String
-}
-
-private struct GmailLabelListResponse: Decodable {
-    let labels: [GmailLabel]
-}
-
-private struct GmailLabel: Decodable {
-    let id: String
-    let messagesTotal: Int?
 }
 
 private struct GmailMessageListResponse: Decodable {
@@ -792,7 +815,7 @@ private struct GmailPayload: Decodable {
     let headers: [GmailHeader]
 }
 
-private struct GmailHeader: Decodable {
+private struct GmailHeader: Decodable, Sendable {
     let name: String
     let value: String
 }
