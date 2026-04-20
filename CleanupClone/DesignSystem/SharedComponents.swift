@@ -1,3 +1,5 @@
+import AVFoundation
+import AVKit
 import Photos
 import SwiftUI
 import UIKit
@@ -365,9 +367,13 @@ struct PhotoThumbnailView: View {
                 .fill(Color.white.opacity(0.06))
 
             if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
+                GeometryReader { geo in
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                }
             } else {
                 Image(systemName: "photo")
                     .font(.system(size: 28, weight: .medium))
@@ -585,6 +591,182 @@ struct PhotoPreviewView: View {
     }
 }
 
+// MARK: - Video Player
+
+struct VideoPlayerView: View {
+    let localIdentifier: String
+    let autoPlay: Bool
+
+    @State private var player: AVPlayer?
+    @State private var isLoading = true
+    @State private var isPlaying = false
+    @State private var showControls = true
+    @State private var controlTimer: Task<Void, Never>?
+
+    init(localIdentifier: String, autoPlay: Bool = true) {
+        self.localIdentifier = localIdentifier
+        self.autoPlay = autoPlay
+    }
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+
+            if let player {
+                VideoPlayerLayer(player: player)
+                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .onTapGesture { toggleControls() }
+
+                // Play/Pause overlay
+                if showControls {
+                    Button {
+                        togglePlayback()
+                    } label: {
+                        Image(systemName: isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                            .font(.system(size: 56))
+                            .foregroundStyle(.white.opacity(0.9))
+                            .shadow(color: .black.opacity(0.4), radius: 8, y: 2)
+                    }
+                    .buttonStyle(.plain)
+                    .transition(.opacity)
+                }
+            } else if isLoading {
+                ProgressView()
+                    .tint(.white.opacity(0.8))
+            }
+        }
+        .task(id: localIdentifier) {
+            await loadVideo(for: localIdentifier)
+        }
+        .onDisappear {
+            controlTimer?.cancel()
+            player?.pause()
+            player = nil
+        }
+    }
+
+    private func loadVideo(for identifier: String) async {
+        isLoading = true
+        player?.pause()
+        player = nil
+
+        guard let phAsset = await MainActor.run(body: {
+            PhotoAssetLookup.shared.asset(for: identifier) ?? fallbackAsset(for: identifier)
+        }) else {
+            isLoading = false
+            return
+        }
+
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .automatic
+
+        await withCheckedContinuation { continuation in
+            var didResume = false
+            PHCachingImageManager.default().requestAVAsset(forVideo: phAsset, options: options) { avAsset, _, _ in
+                Task { @MainActor in
+                    if let avAsset {
+                        let playerItem = AVPlayerItem(asset: avAsset)
+                        let newPlayer = AVPlayer(playerItem: playerItem)
+                        newPlayer.isMuted = true
+                        self.player = newPlayer
+                        self.isLoading = false
+
+                        // Loop playback
+                        NotificationCenter.default.addObserver(
+                            forName: .AVPlayerItemDidPlayToEndTime,
+                            object: playerItem,
+                            queue: .main
+                        ) { _ in
+                            newPlayer.seek(to: .zero)
+                            newPlayer.play()
+                        }
+
+                        if autoPlay {
+                            newPlayer.play()
+                            isPlaying = true
+                            scheduleControlHide()
+                        }
+                    } else {
+                        self.isLoading = false
+                    }
+
+                    if !didResume {
+                        didResume = true
+                        continuation.resume()
+                    }
+                }
+            }
+        }
+    }
+
+    private func togglePlayback() {
+        guard let player else { return }
+        if isPlaying {
+            player.pause()
+            isPlaying = false
+            controlTimer?.cancel()
+        } else {
+            player.play()
+            isPlaying = true
+            scheduleControlHide()
+        }
+    }
+
+    private func toggleControls() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showControls.toggle()
+        }
+        if showControls && isPlaying {
+            scheduleControlHide()
+        }
+    }
+
+    private func scheduleControlHide() {
+        controlTimer?.cancel()
+        controlTimer = Task {
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.3)) {
+                showControls = false
+            }
+        }
+    }
+
+    @MainActor
+    private func fallbackAsset(for identifier: String) -> PHAsset? {
+        let result = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+        guard let asset = result.firstObject else { return nil }
+        PhotoAssetLookup.shared.upsert(asset)
+        return asset
+    }
+}
+
+/// UIViewRepresentable wrapper for AVPlayerLayer to get proper video rendering
+private struct VideoPlayerLayer: UIViewRepresentable {
+    let player: AVPlayer
+
+    func makeUIView(context: Context) -> PlayerUIView {
+        let view = PlayerUIView()
+        view.playerLayer.player = player
+        view.playerLayer.videoGravity = .resizeAspect
+        view.backgroundColor = .clear
+        return view
+    }
+
+    func updateUIView(_ uiView: PlayerUIView, context: Context) {
+        uiView.playerLayer.player = player
+    }
+
+    final class PlayerUIView: UIView {
+        override class var layerClass: AnyClass { AVPlayerLayer.self }
+        var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+    }
+}
+
+// MARK: - Zoomable Photo
+
 private struct ZoomablePhotoContainer: UIViewRepresentable {
     let image: UIImage
 
@@ -675,5 +857,149 @@ private final class ZoomablePhotoScrollView: UIScrollView, UIScrollViewDelegate 
             x: contentSize.width * 0.5 + offsetX,
             y: contentSize.height * 0.5 + offsetY
         )
+    }
+}
+
+// MARK: - Drag-to-Select Grid Support
+
+/// PreferenceKey that collects cell frames keyed by item ID.
+struct DragSelectCellFrameKey: PreferenceKey {
+    nonisolated(unsafe) static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// Modifier that reports a cell's frame in the given coordinate space.
+struct DragSelectCellModifier: ViewModifier {
+    let id: String
+    let coordinateSpace: String
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                GeometryReader { geo in
+                    Color.clear.preference(
+                        key: DragSelectCellFrameKey.self,
+                        value: [id: geo.frame(in: .named(coordinateSpace))]
+                    )
+                }
+            )
+    }
+}
+
+/// Observable state for drag-to-select gesture.
+@MainActor
+final class DragSelectState: ObservableObject {
+    @Published var isDragging = false
+
+    /// IDs of items the finger has passed over during this drag.
+    @Published var dragSelectedIDs: Set<String> = []
+
+    /// The ordered list of item IDs in the grid (row-major order).
+    var orderedIDs: [String] = []
+
+    /// Cell frames keyed by ID, updated from preference changes.
+    var cellFrames: [String: CGRect] = [:]
+
+    /// Index of the first cell the drag started on.
+    private var anchorIndex: Int?
+
+    /// Whether the anchor cell was already selected (drag to deselect).
+    private var isDeselecting = false
+
+    /// The pre-drag selection state, so we can compute the delta.
+    private var baseSelection: Set<String> = []
+
+    func dragBegan(at point: CGPoint, currentSelection: Set<String>) {
+        guard let hitID = cellID(at: point),
+              let hitIndex = orderedIDs.firstIndex(of: hitID) else { return }
+
+        isDragging = true
+        anchorIndex = hitIndex
+        baseSelection = currentSelection
+        isDeselecting = currentSelection.contains(hitID)
+
+        // Immediately include the anchor cell
+        dragSelectedIDs = [hitID]
+    }
+
+    func dragMoved(to point: CGPoint) -> Set<String>? {
+        guard isDragging, let anchorIndex else { return nil }
+
+        // Find the cell closest to the current point
+        guard let currentID = cellID(at: point),
+              let currentIndex = orderedIDs.firstIndex(of: currentID) else { return nil }
+
+        // Select all cells between anchor and current position (inclusive)
+        let lo = min(anchorIndex, currentIndex)
+        let hi = max(anchorIndex, currentIndex)
+        let swept = Set(orderedIDs[lo...hi])
+
+        dragSelectedIDs = swept
+
+        // Compute the resulting selection
+        if isDeselecting {
+            return baseSelection.subtracting(swept)
+        } else {
+            return baseSelection.union(swept)
+        }
+    }
+
+    func dragEnded() -> Set<String>? {
+        guard isDragging else { return nil }
+        isDragging = false
+
+        let result: Set<String>
+        if isDeselecting {
+            result = baseSelection.subtracting(dragSelectedIDs)
+        } else {
+            result = baseSelection.union(dragSelectedIDs)
+        }
+
+        dragSelectedIDs.removeAll()
+        anchorIndex = nil
+        baseSelection.removeAll()
+        return result
+    }
+
+    func cancelDrag() {
+        isDragging = false
+        dragSelectedIDs.removeAll()
+        anchorIndex = nil
+        baseSelection.removeAll()
+    }
+
+    /// Find which cell contains the given point.
+    private func cellID(at point: CGPoint) -> String? {
+        // First try exact hit test
+        for (id, frame) in cellFrames {
+            if frame.contains(point) { return id }
+        }
+
+        // If no exact hit, find the closest cell (allows dragging between cells)
+        var bestID: String?
+        var bestDist = CGFloat.greatestFiniteMagnitude
+        for (id, frame) in cellFrames {
+            let cx = frame.midX
+            let cy = frame.midY
+            let dx = point.x - cx
+            let dy = point.y - cy
+            let dist = dx * dx + dy * dy
+            if dist < bestDist {
+                bestDist = dist
+                bestID = id
+            }
+        }
+
+        // Only snap to closest cell if within reasonable distance (1.5x cell size)
+        if let bestID, let frame = cellFrames[bestID] {
+            let maxSnapDist = max(frame.width, frame.height) * 1.5
+            if bestDist < maxSnapDist * maxSnapDist {
+                return bestID
+            }
+        }
+
+        return nil
     }
 }

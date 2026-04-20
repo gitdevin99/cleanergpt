@@ -53,6 +53,7 @@ private struct CompressionRunSummary {
 
 struct CompressView: View {
     @EnvironmentObject private var appFlow: AppFlow
+    @Environment(\.dismiss) private var dismiss
 
     private static let assetPageSize = 36
     private static let assetPrefetchThreshold = 8
@@ -66,13 +67,15 @@ struct CompressView: View {
     @State private var showDeletePrompt = false
     @State private var runSummary: CompressionRunSummary?
     @State private var displayedAssetLimit = Self.assetPageSize
+    @StateObject private var dragSelect = DragSelectState()
 
+    /// Use cached arrays from AppFlow instead of recomputing on every render.
     private var visibleAssets: [MediaAssetRecord] {
         switch selectedSection {
         case .photos:
-            appFlow.compressiblePhotoAssets()
+            appFlow.cachedCompressiblePhotos
         case .videos:
-            appFlow.compressibleVideoAssets()
+            appFlow.cachedCompressibleVideos
         }
     }
 
@@ -81,11 +84,12 @@ struct CompressView: View {
     }
 
     private var hasMoreVisibleAssets: Bool {
-        pagedVisibleAssets.count < visibleAssets.count
+        visibleAssets.count > displayedAssetLimit
     }
 
     private var selectedAssets: [MediaAssetRecord] {
-        visibleAssets.filter { selectedAssetIDs.contains($0.id) }
+        guard !selectedAssetIDs.isEmpty else { return [] }
+        return visibleAssets.filter { selectedAssetIDs.contains($0.id) }
     }
 
     private var leadAsset: MediaAssetRecord? {
@@ -93,18 +97,18 @@ struct CompressView: View {
     }
 
     private var estimatedSavedBytes: Int64 {
-        selectedAssets.reduce(0) { partial, asset in
-            partial + max(0, asset.sizeInBytes - estimatedCompressedBytes(for: asset))
+        selectedAssets.reduce(into: Int64(0)) { partial, asset in
+            partial += max(0, asset.sizeInBytes - estimatedCompressedBytes(for: asset))
         }
     }
 
     private var totalVisibleBytes: Int64 {
-        visibleAssets.reduce(0) { $0 + $1.sizeInBytes }
+        visibleAssets.reduce(into: Int64(0)) { $0 += $1.sizeInBytes }
     }
 
     private var totalVisibleEstimatedSavedBytes: Int64 {
-        visibleAssets.reduce(0) { partial, asset in
-            partial + max(0, asset.sizeInBytes - estimatedCompressedBytes(for: asset))
+        visibleAssets.reduce(into: Int64(0)) { partial, asset in
+            partial += max(0, asset.sizeInBytes - estimatedCompressedBytes(for: asset))
         }
     }
 
@@ -129,47 +133,46 @@ struct CompressView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            FeatureScreen(
-                title: "Compress",
-                leadingSymbol: "chevron.left",
-                trailingSymbol: toolbarTrailingSymbol,
-                leadingAction: { handleLeadingAction() },
-                trailingAction: { handleTrailingAction() }
-            ) {
-                ZStack {
-                    ScrollView(showsIndicators: false) {
-                        VStack(alignment: .leading, spacing: 16) {
-                            if !appFlow.photoAuthorization.isReadable {
-                                permissionCard
-                            } else {
-                                switch stage {
-                                case .selection:
-                                    selectionContent
-                                case .quality:
-                                    qualityContent
-                                case .processing:
-                                    processingContent
-                                case .success:
-                                    successContent
-                                }
+        FeatureScreen(
+            title: "Compress",
+            leadingSymbol: "chevron.left",
+            trailingSymbol: toolbarTrailingSymbol,
+            leadingAction: { handleLeadingAction() },
+            trailingAction: { handleTrailingAction() }
+        ) {
+            ZStack {
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if !appFlow.photoAuthorization.isReadable {
+                            permissionCard
+                        } else {
+                            switch stage {
+                            case .selection:
+                                selectionContent
+                            case .quality:
+                                qualityContent
+                            case .processing:
+                                processingContent
+                            case .success:
+                                successContent
                             }
                         }
-                        .padding(.bottom, shouldShowFloatingSelectionButton ? 136 : 24)
                     }
+                    .padding(.bottom, shouldShowFloatingSelectionButton ? 136 : 24)
+                }
+                .scrollDisabled(dragSelect.isDragging)
 
-                    if showDeletePrompt {
-                        deleteOriginalOverlay
-                    }
+                if showDeletePrompt {
+                    deleteOriginalOverlay
                 }
             }
-            .navigationBarHidden(true)
-            .safeAreaInset(edge: .bottom) {
-                if shouldShowFloatingSelectionButton {
-                    floatingSelectionButton
-                        .padding(.horizontal, 14)
-                        .padding(.top, 8)
-                }
+        }
+        .navigationBarHidden(true)
+        .safeAreaInset(edge: .bottom) {
+            if shouldShowFloatingSelectionButton {
+                floatingSelectionButton
+                    .padding(.horizontal, 14)
+                    .padding(.top, 8)
             }
         }
         .onChange(of: selectedSection) { _, _ in
@@ -387,21 +390,43 @@ struct CompressView: View {
         }
     }
 
+    private static let gridColumns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
+
     private var assetsGrid: some View {
-        VStack(spacing: 14) {
-            LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
-                ForEach(pagedVisibleAssets) { asset in
-                    Button {
-                        toggleSelection(for: asset.id)
-                    } label: {
-                        assetCard(asset)
-                    }
-                    .buttonStyle(.plain)
-                    .onAppear {
-                        loadMoreAssetsIfNeeded(currentAssetID: asset.id)
-                    }
+        let paged = pagedVisibleAssets
+
+        return VStack(spacing: 14) {
+            LazyVGrid(columns: Self.gridColumns, spacing: 12) {
+                ForEach(paged) { asset in
+                    compressAssetCell(asset)
+                        .modifier(DragSelectCellModifier(id: asset.id, coordinateSpace: "compressGrid"))
+                        .onAppear {
+                            loadMoreAssetsIfNeeded(currentAssetID: asset.id)
+                        }
                 }
             }
+            .coordinateSpace(name: "compressGrid")
+            .onPreferenceChange(DragSelectCellFrameKey.self) { frames in
+                dragSelect.cellFrames = frames
+            }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 12, coordinateSpace: .named("compressGrid"))
+                    .onChanged { value in
+                        if !dragSelect.isDragging {
+                            dragSelect.orderedIDs = paged.map(\.id)
+                            dragSelect.dragBegan(at: value.startLocation, currentSelection: selectedAssetIDs)
+                        }
+                        if let newSelection = dragSelect.dragMoved(to: value.location) {
+                            selectedAssetIDs = newSelection
+                        }
+                    }
+                    .onEnded { _ in
+                        if let finalSelection = dragSelect.dragEnded() {
+                            selectedAssetIDs = finalSelection
+                        }
+                    }
+            )
+            .drawingGroup()
 
             if hasMoreVisibleAssets {
                 HStack(spacing: 10) {
@@ -416,6 +441,17 @@ struct CompressView: View {
                 .padding(.vertical, 8)
             }
         }
+    }
+
+    @ViewBuilder
+    private func compressAssetCell(_ asset: MediaAssetRecord) -> some View {
+        let isSelected = selectedAssetIDs.contains(asset.id)
+        Button {
+            toggleSelection(for: asset.id)
+        } label: {
+            compressAssetCardContent(asset, isSelected: isSelected)
+        }
+        .buttonStyle(.plain)
     }
 
     private var floatingSelectionButton: some View {
@@ -603,7 +639,7 @@ struct CompressView: View {
         .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
-    private func assetCard(_ asset: MediaAssetRecord) -> some View {
+    private func compressAssetCardContent(_ asset: MediaAssetRecord, isSelected: Bool) -> some View {
         let estimate = max(0, asset.sizeInBytes - estimatedCompressedBytes(for: asset))
 
         return GlassCard(cornerRadius: 24) {
@@ -614,9 +650,9 @@ struct CompressView: View {
                         .aspectRatio(1, contentMode: .fill)
                         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
 
-                    Image(systemName: selectedAssetIDs.contains(asset.id) ? "checkmark.circle.fill" : "circle")
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .font(.system(size: 22, weight: .bold))
-                        .foregroundStyle(selectedAssetIDs.contains(asset.id) ? CleanupTheme.electricBlue : .white.opacity(0.82))
+                        .foregroundStyle(isSelected ? CleanupTheme.electricBlue : .white.opacity(0.82))
                         .padding(10)
                 }
 
@@ -684,6 +720,7 @@ struct CompressView: View {
     private func handleLeadingAction() {
         switch stage {
         case .selection, .success:
+            dismiss()
             appFlow.closeFeature()
         case .quality:
             stage = .selection
@@ -727,10 +764,12 @@ struct CompressView: View {
     }
 
     private func loadMoreAssetsIfNeeded(currentAssetID: String) {
-        guard hasMoreVisibleAssets else { return }
-        guard let currentIndex = pagedVisibleAssets.firstIndex(where: { $0.id == currentAssetID }) else { return }
+        guard visibleAssets.count > displayedAssetLimit else { return }
+        let pagedCount = min(displayedAssetLimit, visibleAssets.count)
+        let triggerIndex = max(pagedCount - Self.assetPrefetchThreshold, 0)
 
-        let triggerIndex = max(pagedVisibleAssets.count - Self.assetPrefetchThreshold, 0)
+        // Use the paged slice directly to find the index without creating a new array
+        guard let currentIndex = visibleAssets.prefix(pagedCount).firstIndex(where: { $0.id == currentAssetID }) else { return }
         guard currentIndex >= triggerIndex else { return }
 
         displayedAssetLimit = min(displayedAssetLimit + Self.assetPageSize, visibleAssets.count)

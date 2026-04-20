@@ -1,3 +1,4 @@
+import Photos
 import SwiftUI
 
 private enum DashboardSection: String, CaseIterable, Identifiable {
@@ -196,6 +197,17 @@ struct DashboardView: View {
                     eyebrow: "Want to save up extra space?",
                     title: "Compress",
                     accent: CleanupTheme.accentCyan
+                )
+            }
+            .buttonStyle(.plain)
+
+            NavigationLink {
+                SpeakerCleanView()
+            } label: {
+                wideActionCard(
+                    eyebrow: "Dust or water in your speaker?",
+                    title: "Speaker Clean",
+                    accent: Color(hex: "#2DD4BF")
                 )
             }
             .buttonStyle(.plain)
@@ -1163,6 +1175,15 @@ struct MediaCategoryReviewView: View {
     @State private var appliedFilter = MediaReviewFilter()
     @State private var draftFilter = MediaReviewFilter()
 
+    /// Cached filtered results — rebuilt only when source data or filter changes.
+    @State private var cachedFilteredClusters: [MediaCluster] = []
+    @State private var cachedFilteredAssets: [MediaAssetRecord] = []
+    @State private var lastClusterCount = -1
+    @State private var lastAssetCount = -1
+
+    /// Drag-to-select state for screenshot gallery.
+    @StateObject private var dragSelect = DragSelectState()
+
     init(category: DashboardCategoryKind, preselectAll: Bool = false) {
         self.category = category
         self.preselectAll = preselectAll
@@ -1181,11 +1202,18 @@ struct MediaCategoryReviewView: View {
     }
 
     private var filteredReviewAssets: [MediaAssetRecord] {
-        appliedFilter.apply(to: reviewAssets)
+        cachedFilteredAssets
     }
 
     private var filteredClusters: [MediaCluster] {
-        appliedFilter.apply(to: clusters)
+        cachedFilteredClusters
+    }
+
+    private func rebuildFilteredCaches() {
+        cachedFilteredClusters = appliedFilter.apply(to: clusters)
+        cachedFilteredAssets = appliedFilter.apply(to: reviewAssets)
+        lastClusterCount = clusters.count
+        lastAssetCount = reviewAssets.count
     }
 
     private var isRefiningExactClusters: Bool {
@@ -1198,22 +1226,23 @@ struct MediaCategoryReviewView: View {
 
     private var selectedDeletionIDs: [String] {
         if usesFlatScreenshotGallery {
-            return filteredReviewAssets
-                .map(\.id)
-                .filter { selectedAssetIDs.contains($0) }
+            guard !selectedAssetIDs.isEmpty else { return [] }
+            return selectedAssetIDs.filter { id in
+                cachedFilteredAssets.contains { $0.id == id }
+            }.sorted()
         }
 
-        return Array(
-            Set(
-                filteredClusters
-                    .filter { selectedClusterIDs.contains($0.id) }
-                    .flatMap { deletionCandidateIDs(in: $0) }
-            )
-        )
+        guard !selectedClusterIDs.isEmpty else { return [] }
+        var result = Set<String>()
+        for cluster in cachedFilteredClusters where selectedClusterIDs.contains(cluster.id) {
+            let candidates = cluster.assets.dropFirst().map(\.id)
+            result.formUnion(candidates)
+        }
+        return Array(result)
     }
 
     private var displayedClusters: [MediaCluster] {
-        Array(filteredClusters.prefix(visibleClusterCount))
+        Array(cachedFilteredClusters.prefix(visibleClusterCount))
     }
 
     var body: some View {
@@ -1225,8 +1254,6 @@ struct MediaCategoryReviewView: View {
             trailingAction: { Task { await appFlow.scanLibrary() } }
         ) {
             VStack(alignment: .leading, spacing: 18) {
-                summaryCard
-
                 if !appFlow.photoAuthorization.isReadable {
                     permissionCard
                 } else if filteredContentIsEmpty {
@@ -1262,21 +1289,33 @@ struct MediaCategoryReviewView: View {
                 },
                 onApply: {
                     appliedFilter = draftFilter
-                    visibleClusterCount = min(50, filteredClusters.count)
-                    selectedClusterIDs.formIntersection(Set(filteredClusters.map(\.id)))
-                    selectedAssetIDs.formIntersection(Set(filteredReviewAssets.map(\.id)))
+                    // rebuildFilteredCaches is called by onChange(of: appliedFilter)
+                    visibleClusterCount = min(50, cachedFilteredClusters.count)
+                    selectedClusterIDs.formIntersection(Set(cachedFilteredClusters.map(\.id)))
+                    selectedAssetIDs.formIntersection(Set(cachedFilteredAssets.map(\.id)))
                     isShowingFilterSheet = false
                 }
             )
         }
-        .task(id: reviewAssets.map(\.id)) {
-            selectedClusterIDs.formIntersection(Set(filteredClusters.map(\.id)))
+        .task {
+            rebuildFilteredCaches()
             applyInitialSelectionIfNeeded()
             syncScreenshotSelection()
-            visibleClusterCount = min(50, filteredClusters.count)
+        }
+        .onChange(of: clusters.count) { _, newCount in
+            guard newCount != lastClusterCount else { return }
+            rebuildFilteredCaches()
+            selectedClusterIDs.formIntersection(Set(cachedFilteredClusters.map(\.id)))
+            applyInitialSelectionIfNeeded()
+            syncScreenshotSelection()
+        }
+        .onChange(of: reviewAssets.count) { _, newCount in
+            guard newCount != lastAssetCount else { return }
+            rebuildFilteredCaches()
         }
         .onChange(of: appliedFilter) { _, newValue in
             draftFilter = newValue
+            rebuildFilteredCaches()
         }
     }
 
@@ -1295,7 +1334,7 @@ struct MediaCategoryReviewView: View {
                             .font(CleanupFont.caption(12))
                             .foregroundStyle(CleanupTheme.textTertiary)
                     } else {
-                        Text("\(filteredClusters.count) exact sets ready to review")
+                        Text("\(cachedFilteredClusters.count) exact sets ready to review")
                             .font(CleanupFont.caption(12))
                             .foregroundStyle(CleanupTheme.textTertiary)
                     }
@@ -1408,43 +1447,72 @@ struct MediaCategoryReviewView: View {
     }
 
     private var screenshotGallery: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        let assets = cachedFilteredAssets
+        let accentColor = sourceCategory.accent
+
+        return VStack(alignment: .leading, spacing: 16) {
             screenshotActionBar
 
             ScrollView(showsIndicators: false) {
-                LazyVGrid(columns: screenshotGridColumns, spacing: 12) {
-                    ForEach(filteredReviewAssets) { asset in
+                LazyVGrid(columns: Self.screenshotGridColumns, spacing: 12) {
+                    ForEach(assets) { asset in
                         Button {
                             toggleScreenshotSelection(asset.id)
                         } label: {
                             ScreenshotGalleryCell(
                                 asset: asset,
                                 isSelected: selectedAssetIDs.contains(asset.id),
-                                accent: sourceCategory.accent
+                                accent: accentColor
                             )
                         }
                         .buttonStyle(.plain)
+                        .modifier(DragSelectCellModifier(id: asset.id, coordinateSpace: "screenshotGrid"))
                     }
                 }
+                .coordinateSpace(name: "screenshotGrid")
+                .onPreferenceChange(DragSelectCellFrameKey.self) { frames in
+                    dragSelect.cellFrames = frames
+                }
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 12, coordinateSpace: .named("screenshotGrid"))
+                        .onChanged { value in
+                            if !dragSelect.isDragging {
+                                dragSelect.orderedIDs = assets.map(\.id)
+                                dragSelect.dragBegan(at: value.startLocation, currentSelection: selectedAssetIDs)
+                            }
+                            if let newSelection = dragSelect.dragMoved(to: value.location) {
+                                selectedAssetIDs = newSelection
+                            }
+                        }
+                        .onEnded { _ in
+                            if let finalSelection = dragSelect.dragEnded() {
+                                selectedAssetIDs = finalSelection
+                            }
+                        }
+                )
                 .padding(.bottom, 120)
             }
+            .scrollDisabled(dragSelect.isDragging)
 
             screenshotDeleteBar
         }
     }
 
     private var clusterList: some View {
-        ScrollView(showsIndicators: false) {
+        let displayed = displayedClusters
+        let accentColor = sourceCategory.accent
+
+        return ScrollView(showsIndicators: false) {
             LazyVStack(spacing: 14) {
-                if clusters.isEmpty {
+                if cachedFilteredClusters.isEmpty {
                     clusterErrorState
                 } else {
-                    ForEach(Array(displayedClusters.enumerated()), id: \.element.id) { index, cluster in
+                    ForEach(displayed) { cluster in
                         ClusterSummaryCard(
                             cluster: cluster,
-                            accent: sourceCategory.accent,
+                            accent: accentColor,
                             isSelected: selectedClusterIDs.contains(cluster.id),
-                            duplicateCount: deletionCandidateIDs(in: cluster).count,
+                            duplicateCount: max(cluster.assets.count - 1, 0),
                             onToggleSelection: {
                                 toggleClusterSelection(cluster.id)
                             },
@@ -1457,13 +1525,11 @@ struct MediaCategoryReviewView: View {
                             }
                         )
                         .onAppear {
-                            PhotoThumbnailView.startCaching(localIdentifiers: preheatIdentifiers(around: index))
-                            if index >= displayedClusters.count - 8 {
-                                loadMoreClustersIfNeeded()
+                            if let idx = displayed.firstIndex(where: { $0.id == cluster.id }) {
+                                if idx >= displayed.count - 8 {
+                                    loadMoreClustersIfNeeded()
+                                }
                             }
-                        }
-                        .onDisappear {
-                            PhotoThumbnailView.stopCaching(localIdentifiers: preheatIdentifiers(around: index))
                         }
                     }
                 }
@@ -1474,11 +1540,11 @@ struct MediaCategoryReviewView: View {
 
     private var screenshotActionBar: some View {
         HStack(spacing: 12) {
-            Button(selectedAssetIDs.count == filteredReviewAssets.count ? "Clear" : "Select all") {
-                if selectedAssetIDs.count == filteredReviewAssets.count {
+            Button(selectedAssetIDs.count == cachedFilteredAssets.count ? "Clear" : "Select all") {
+                if selectedAssetIDs.count == cachedFilteredAssets.count {
                     selectedAssetIDs.removeAll()
                 } else {
-                    selectedAssetIDs = Set(filteredReviewAssets.map(\.id))
+                    selectedAssetIDs = Set(cachedFilteredAssets.map(\.id))
                 }
             }
             .font(CleanupFont.body(15))
@@ -1542,7 +1608,7 @@ struct MediaCategoryReviewView: View {
     }
 
     private var selectableClusters: [MediaCluster] {
-        filteredClusters.filter { deletionCandidateIDs(in: $0).isEmpty == false }
+        cachedFilteredClusters.filter { $0.assets.count > 1 }
     }
 
     private func deletionCandidateIDs(in cluster: MediaCluster) -> [String] {
@@ -1559,8 +1625,8 @@ struct MediaCategoryReviewView: View {
     }
 
     private func loadMoreClustersIfNeeded() {
-        guard visibleClusterCount < filteredClusters.count else { return }
-        visibleClusterCount = min(visibleClusterCount + 50, filteredClusters.count)
+        guard visibleClusterCount < cachedFilteredClusters.count else { return }
+        visibleClusterCount = min(visibleClusterCount + 50, cachedFilteredClusters.count)
     }
 
     private func preheatIdentifiers(around displayedIndex: Int) -> [String] {
@@ -1573,15 +1639,13 @@ struct MediaCategoryReviewView: View {
             .flatMap { Array($0.assets.prefix(2)).map(\.id) }
     }
 
-    private var screenshotGridColumns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: 12), count: 3)
-    }
+    private static let screenshotGridColumns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 3)
 
     private func syncScreenshotSelection() {
         guard usesFlatScreenshotGallery else { return }
-        let validIDs = Set(filteredReviewAssets.map(\.id))
+        let validIDs = Set(cachedFilteredAssets.map(\.id))
         selectedAssetIDs.formIntersection(validIDs)
-        guard preselectAll, !didApplyInitialSelection, !filteredReviewAssets.isEmpty else { return }
+        guard preselectAll, !didApplyInitialSelection, !cachedFilteredAssets.isEmpty else { return }
         selectedAssetIDs = validIDs
         didApplyInitialSelection = true
     }
@@ -1595,15 +1659,15 @@ struct MediaCategoryReviewView: View {
     }
 
     private var filteredItemCount: Int {
-        usesFlatScreenshotGallery ? filteredReviewAssets.count : filteredClusters.reduce(0) { $0 + $1.assets.count }
+        usesFlatScreenshotGallery ? cachedFilteredAssets.count : cachedFilteredClusters.reduce(into: 0) { $0 += $1.assets.count }
     }
 
     private var filteredTotalBytes: Int64 {
-        usesFlatScreenshotGallery ? filteredReviewAssets.reduce(0) { $0 + $1.sizeInBytes } : filteredClusters.reduce(0) { $0 + $1.totalBytes }
+        usesFlatScreenshotGallery ? cachedFilteredAssets.reduce(into: Int64(0)) { $0 += $1.sizeInBytes } : cachedFilteredClusters.reduce(into: Int64(0)) { $0 += $1.totalBytes }
     }
 
     private var filteredContentIsEmpty: Bool {
-        usesFlatScreenshotGallery ? filteredReviewAssets.isEmpty : filteredClusters.isEmpty
+        usesFlatScreenshotGallery ? cachedFilteredAssets.isEmpty : cachedFilteredClusters.isEmpty
     }
 
     private var filterSummaryLine: String {
@@ -1791,11 +1855,19 @@ private struct MediaReviewFilter: Equatable {
     }
 
     func apply(to assets: [MediaAssetRecord]) -> [MediaAssetRecord] {
-        assets.filter(matchesDateRange).sorted(by: assetComparator)
+        // Short-circuit: no date filter and default sort → return as-is (already sorted by AppFlow)
+        if startDate == nil && endDate == nil && sortMode == .newest {
+            return assets
+        }
+        return assets.filter(matchesDateRange).sorted(by: assetComparator)
     }
 
     func apply(to clusters: [MediaCluster]) -> [MediaCluster] {
-        clusters.compactMap { cluster in
+        // Short-circuit: no date filter and default sort → return as-is (already sorted by AppFlow)
+        if startDate == nil && endDate == nil && sortMode == .newest {
+            return clusters
+        }
+        return clusters.compactMap { cluster in
             let filteredAssets = cluster.assets.filter(matchesDateRange)
             guard !filteredAssets.isEmpty else { return nil }
             return MediaCluster(
@@ -2860,7 +2932,8 @@ private struct ClusterZoomPreviewSheet: View {
                             asset: asset,
                             isProtected: index == 0,
                             isSelected: selectedAssetIDs.contains(asset.id),
-                            accent: accent
+                            accent: accent,
+                            isVisible: index == currentIndex
                         )
                         .tag(index)
                     }
@@ -2906,7 +2979,10 @@ private struct ClusterZoomPreviewSheet: View {
     }
 
     private var helpText: String {
-        currentAssetProtected ? "The first image stays protected as the keep choice." : "Swipe to compare, then tick duplicates you want to remove."
+        if currentAssetProtected {
+            return "The first item stays protected as the keep choice."
+        }
+        return "Swipe to compare, then tick duplicates you want to remove."
     }
 
     private func toggleCurrentSelection() {
@@ -2927,10 +3003,20 @@ private struct ClusterDetailAssetCell: View {
     let onToggle: () -> Void
     let onZoom: () -> Void
 
+    private var isVideo: Bool { asset.mediaType == .video }
+
     var body: some View {
         ZStack {
             PhotoThumbnailView(localIdentifier: asset.id, targetPointSize: 180)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+            // Play icon overlay for videos
+            if isVideo {
+                Image(systemName: "play.circle.fill")
+                    .font(.system(size: 32))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+            }
 
             VStack {
                 HStack {
@@ -2960,24 +3046,35 @@ private struct ClusterDetailAssetCell: View {
                 }
 
                 Spacer()
-            }
-            .padding(8)
 
-            if isProtected {
-                VStack {
-                    Spacer()
-                    HStack {
+                // Bottom row: Keep badge + video duration
+                HStack {
+                    if isProtected {
                         Text("Keep")
                             .font(CleanupFont.badge(10))
                             .foregroundStyle(Color(hex: "#13331E"))
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
                             .background(Color(hex: "#7DFF99"), in: Capsule(style: .continuous))
-                        Spacer()
+                    }
+
+                    Spacer()
+
+                    if isVideo {
+                        HStack(spacing: 3) {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 7))
+                            Text(formattedDuration(asset.duration))
+                                .font(CleanupFont.badge(10))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Color.black.opacity(0.6), in: Capsule(style: .continuous))
                     }
                 }
-                .padding(8)
             }
+            .padding(8)
         }
         .aspectRatio(1, contentMode: .fit)
         .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -2991,6 +3088,13 @@ private struct ClusterDetailAssetCell: View {
             onToggle()
         }
     }
+
+    private func formattedDuration(_ value: TimeInterval) -> String {
+        let totalSeconds = Int(value.rounded())
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        return String(format: "%d:%02d", minutes, seconds)
+    }
 }
 
 private struct ZoomableAssetPreview: View {
@@ -2998,22 +3102,53 @@ private struct ZoomableAssetPreview: View {
     let isProtected: Bool
     let isSelected: Bool
     let accent: Color
+    let isVisible: Bool
+
+    init(asset: MediaAssetRecord, isProtected: Bool, isSelected: Bool, accent: Color, isVisible: Bool = true) {
+        self.asset = asset
+        self.isProtected = isProtected
+        self.isSelected = isSelected
+        self.accent = accent
+        self.isVisible = isVisible
+    }
+
+    private var isVideo: Bool { asset.mediaType == .video }
 
     var body: some View {
         VStack(spacing: 14) {
-            PhotoPreviewView(localIdentifier: asset.id)
+            Group {
+                if isVideo {
+                    VideoPlayerView(localIdentifier: asset.id, autoPlay: isVisible)
+                } else {
+                    PhotoPreviewView(localIdentifier: asset.id)
+                }
+            }
             .background(Color.black.opacity(0.24), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
             .overlay(alignment: .bottomLeading) {
-                if isProtected {
-                    Text("Best")
-                        .font(CleanupFont.badge(10))
-                        .foregroundStyle(Color(hex: "#13331E"))
+                HStack(spacing: 6) {
+                    if isProtected {
+                        Text("Best")
+                            .font(CleanupFont.badge(10))
+                            .foregroundStyle(Color(hex: "#13331E"))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color(hex: "#7DFF99"), in: Capsule(style: .continuous))
+                    }
+                    if isVideo {
+                        HStack(spacing: 3) {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 8))
+                            Text(formattedDuration(asset.duration))
+                                .font(CleanupFont.badge(10))
+                        }
+                        .foregroundStyle(.white)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
-                        .background(Color(hex: "#7DFF99"), in: Capsule(style: .continuous))
-                        .padding(12)
+                        .background(Color.black.opacity(0.55), in: Capsule(style: .continuous))
+                    }
                 }
+                .padding(12)
             }
             .overlay(alignment: .bottomTrailing) {
                 if isProtected == false {
@@ -3032,5 +3167,12 @@ private struct ZoomableAssetPreview: View {
             }
             .frame(height: 520)
         }
+    }
+
+    private func formattedDuration(_ value: TimeInterval) -> String {
+        let totalSeconds = Int(value.rounded())
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        return String(format: "%d:%02d", minutes, seconds)
     }
 }

@@ -14,3 +14,6 @@ xcuserdata/
 # Local outputs
 output/
 tmp/
+
+# Claude Code local state
+.claude/

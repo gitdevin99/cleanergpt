@@ -29,6 +29,7 @@
 		EA39833EB5A6EF87C78BF601 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6C482AEEAC411D5D1556FB3 /* DashboardView.swift */; };
 		FC67CAB3293A45CD9035C534 /* AppFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D1A296461561D27BFF0EAA4 /* AppFlow.swift */; };
 		FD53241676F9EF8010BA262A /* SharedComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32B1E033FE499696312C831A /* SharedComponents.swift */; };
+		B1E4F30A7C2D9E5F01A83D42 /* SpeakerCleanView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3A8D91B5F4E7A0823B16E09 /* SpeakerCleanView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -55,6 +56,7 @@
 		D972287A0D10201863327B1A /* MainShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainShellView.swift; sourceTree = "<group>"; };
 		DCABC7BEDB2792920751B0A5 /* CompressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompressView.swift; sourceTree = "<group>"; };
 		F6C482AEEAC411D5D1556FB3 /* DashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardView.swift; sourceTree = "<group>"; };
+		C3A8D91B5F4E7A0823B16E09 /* SpeakerCleanView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeakerCleanView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -152,6 +154,7 @@
 				3D96818DEF2CC290B9424B6F /* Paywall */,
 				07AA1DF17E8D5168C1CB5E0A /* SecretSpace */,
 				2F034BA116D494D36592868D /* Settings */,
+				F7B2C4E81D3A5F9024E70B13 /* SpeakerClean */,
 			);
 			path = Features;
 			sourceTree = "<group>";
@@ -224,6 +227,14 @@
 				120FD29F8551D78FE80DF4D8 /* ChargingView.swift */,
 			);
 			path = Charging;
+			sourceTree = "<group>";
+		};
+		F7B2C4E81D3A5F9024E70B13 /* SpeakerClean */ = {
+			isa = PBXGroup;
+			children = (
+				C3A8D91B5F4E7A0823B16E09 /* SpeakerCleanView.swift */,
+			);
+			path = SpeakerClean;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -315,6 +326,7 @@
 				6F8F69B9CFF9DB2C59A5C73A /* SecretSpaceView.swift in Sources */,
 				FD53241676F9EF8010BA262A /* SharedComponents.swift in Sources */,
 				4C175486010A1D6FEBF00F3B /* Typography.swift in Sources */,
+				B1E4F30A7C2D9E5F01A83D42 /* SpeakerCleanView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

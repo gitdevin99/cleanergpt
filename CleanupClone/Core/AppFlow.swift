@@ -301,6 +301,18 @@ struct ContactRecord: Identifiable, Hashable {
     let fullName: String
     let phones: [String]
     let emails: [String]
+
+    var initials: String {
+        let parts = fullName.split(separator: " ").prefix(2)
+        if parts.isEmpty { return "?" }
+        return parts.map { String($0.prefix(1)).uppercased() }.joined()
+    }
+
+    var sectionLetter: String {
+        let first = fullName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1).uppercased()
+        guard let char = first.first, char.isLetter, char.isASCII else { return "#" }
+        return String(char)
+    }
 }
 
 struct DuplicateContactGroup: Identifiable, Hashable {
@@ -316,6 +328,32 @@ struct DuplicateContactGroup: Identifiable, Hashable {
         let phones = contacts.reduce(0) { $0 + $1.phones.count }
         let emails = contacts.reduce(0) { $0 + $1.emails.count }
         return "\(phones) phone numbers • \(emails) emails"
+    }
+
+    /// Preview of what the merged contact would look like
+    var mergedPreview: ContactRecord {
+        guard let best = contacts.max(by: { lhs, rhs in
+            let lScore = (lhs.fullName.count * 5) + (lhs.phones.count * 3) + (lhs.emails.count * 3)
+            let rScore = (rhs.fullName.count * 5) + (rhs.phones.count * 3) + (rhs.emails.count * 3)
+            return lScore < rScore
+        }) else {
+            return contacts.first ?? ContactRecord(id: "", fullName: "Unknown", phones: [], emails: [])
+        }
+        var allPhones: [String] = []
+        var seenPhones: Set<String> = []
+        var allEmails: [String] = []
+        var seenEmails: Set<String> = []
+        for c in contacts {
+            for p in c.phones {
+                let normalized = p.filter(\.isNumber)
+                if seenPhones.insert(normalized).inserted { allPhones.append(p) }
+            }
+            for e in c.emails {
+                let normalized = e.lowercased()
+                if seenEmails.insert(normalized).inserted { allEmails.append(e) }
+            }
+        }
+        return ContactRecord(id: best.id, fullName: best.fullName, phones: allPhones, emails: allEmails)
     }
 }
 
@@ -482,6 +520,11 @@ final class AppFlow: ObservableObject {
     @Published var duplicateContactGroups: [DuplicateContactGroup] = []
     @Published var contactAnalysisSummary: ContactAnalysisSummary = .empty
     @Published var isScanningContacts = false
+    @Published var allContacts: [ContactRecord] = []
+    @Published var incompleteContacts: [ContactRecord] = []
+    @Published var isCleaningContacts = false
+    @Published var contactCleaningProgress: (done: Int, total: Int) = (0, 0)
+    @Published var contactCleaningComplete = false
     @Published var eventAnalysisSummary: EventAnalysisSummary = .empty
     @Published var pastEvents: [EventRecord] = []
     @Published var isScanningEvents = false
@@ -493,6 +536,10 @@ final class AppFlow: ObservableObject {
     @Published var compressionResults: [String: MediaCompressionResult] = [:]
     @Published var compressionMessage: String?
     @Published var isCompressingAssetID: String?
+
+    /// Cached compressible asset lists – rebuilt whenever mediaAssetsByCategory changes.
+    @Published private(set) var cachedCompressiblePhotos: [MediaAssetRecord] = []
+    @Published private(set) var cachedCompressibleVideos: [MediaAssetRecord] = []
 
     private(set) var mediaAssetsByCategory: [DashboardCategoryKind: [MediaAssetRecord]] = [:]
     private(set) var mediaClustersByCategory: [DashboardCategoryKind: [MediaCluster]] = [:]
@@ -966,15 +1013,17 @@ final class AppFlow: ObservableObject {
 
             let processedCount = index + 1
 
-            if index.isMultiple(of: 24) || index == fetchResult.count - 1 {
+            let isFinalItem = index == fetchResult.count - 1
+            if index.isMultiple(of: 200) || isFinalItem {
                 scanProgress = CGFloat(processedCount) / CGFloat(total)
                 scanStatusText = libraryScanStatusText(processedCount: processedCount, totalCount: fetchResult.count)
                 scannedLibraryItems = processedCount
-                let shouldPublishSnapshot = index == fetchResult.count - 1
+
+                let shouldPublishSnapshot = isFinalItem
                     || index.isMultiple(of: librarySnapshotBatchSize)
-                    || Date().timeIntervalSince(lastSnapshotPublishAt) >= 0.5
+                    || Date().timeIntervalSince(lastSnapshotPublishAt) >= 2.0
                 if shouldPublishSnapshot {
-                    applyLibrarySnapshot(
+                    await applyLibrarySnapshot(
                         categorized: categorized,
                         duplicateBuckets: duplicateBuckets,
                         similarBuckets: similarBuckets,
@@ -995,7 +1044,7 @@ final class AppFlow: ObservableObject {
 
         await mediaAnalysisStore.upsertMetadataBatch(analysisBatch)
 
-        applyLibrarySnapshot(
+        await applyLibrarySnapshot(
             categorized: categorized,
             duplicateBuckets: duplicateBuckets,
             similarBuckets: similarBuckets,
@@ -1029,6 +1078,8 @@ final class AppFlow: ObservableObject {
         guard contactsAuthorization.isReadable else {
             duplicateContactGroups = []
             contactAnalysisSummary = .empty
+            allContacts = []
+            incompleteContacts = []
             return
         }
 
@@ -1042,8 +1093,8 @@ final class AppFlow: ObservableObject {
         ]
 
         var buckets: [String: [ContactRecord]] = [:]
-        var totalContacts = 0
-        var incompleteContacts = 0
+        var allRecords: [ContactRecord] = []
+        var incompleteRecords: [ContactRecord] = []
         let request = CNContactFetchRequest(keysToFetch: keys)
 
         do {
@@ -1054,9 +1105,9 @@ final class AppFlow: ObservableObject {
                     phones: contact.phoneNumbers.map { $0.value.stringValue },
                     emails: contact.emailAddresses.map { String($0.value) }
                 )
-                totalContacts += 1
+                allRecords.append(record)
                 if self.isIncompleteContact(record) {
-                    incompleteContacts += 1
+                    incompleteRecords.append(record)
                 }
                 let key = self.contactBucketKey(for: record)
                 guard !key.isEmpty else { return }
@@ -1065,6 +1116,8 @@ final class AppFlow: ObservableObject {
         } catch {
             duplicateContactGroups = []
             contactAnalysisSummary = .empty
+            allContacts = []
+            incompleteContacts = []
             isScanningContacts = false
             return
         }
@@ -1081,12 +1134,14 @@ final class AppFlow: ObservableObject {
                 return lhs.duplicateCount > rhs.duplicateCount
             }
 
+        allContacts = allRecords.sorted { $0.fullName.localizedCaseInsensitiveCompare($1.fullName) == .orderedAscending }
+        incompleteContacts = incompleteRecords.sorted { $0.fullName.localizedCaseInsensitiveCompare($1.fullName) == .orderedAscending }
         duplicateContactGroups = duplicateGroups
         contactAnalysisSummary = ContactAnalysisSummary(
-            totalCount: totalContacts,
+            totalCount: allRecords.count,
             duplicateGroupCount: duplicateGroups.count,
             duplicateContactCount: duplicateGroups.reduce(0) { $0 + max(0, $1.duplicateCount - 1) },
-            incompleteCount: incompleteContacts,
+            incompleteCount: incompleteRecords.count,
             backupCount: 0
         )
 
@@ -1194,10 +1249,126 @@ final class AppFlow: ObservableObject {
             CNContactEmailAddressesKey as CNKeyDescriptor
         ]
 
+        do {
+            // 1. Fetch the keeper and collect all unique phones/emails from duplicates
+            let keeperContact = try contactStore.unifiedContact(withIdentifier: keeperID, keysToFetch: keys)
+            guard let keeperMutable = keeperContact.mutableCopy() as? CNMutableContact else { return false }
+
+            var existingPhones = Set(keeperMutable.phoneNumbers.map { $0.value.stringValue.filter(\.isNumber) })
+            var existingEmails = Set(keeperMutable.emailAddresses.map { ($0.value as String).lowercased() })
+
+            let saveRequest = CNSaveRequest()
+
+            for identifier in duplicateIDs {
+                let dup = try contactStore.unifiedContact(withIdentifier: identifier, keysToFetch: keys)
+
+                // Merge unique phones into keeper
+                for phone in dup.phoneNumbers {
+                    let normalized = phone.value.stringValue.filter(\.isNumber)
+                    if !normalized.isEmpty, existingPhones.insert(normalized).inserted {
+                        keeperMutable.phoneNumbers.append(phone.copy() as! CNLabeledValue<CNPhoneNumber>)
+                    }
+                }
+
+                // Merge unique emails into keeper
+                for email in dup.emailAddresses {
+                    let normalized = (email.value as String).lowercased()
+                    if !normalized.isEmpty, existingEmails.insert(normalized).inserted {
+                        keeperMutable.emailAddresses.append(email.copy() as! CNLabeledValue<NSString>)
+                    }
+                }
+
+                // Delete the duplicate
+                if let deletable = dup.mutableCopy() as? CNMutableContact {
+                    saveRequest.delete(deletable)
+                }
+            }
+
+            // 2. Update the keeper with merged fields
+            saveRequest.update(keeperMutable)
+
+            try contactStore.execute(saveRequest)
+            await scanContacts()
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Merge multiple duplicate groups in bulk (single rescan at end)
+    func bulkMergeDuplicateContacts(groups: [DuplicateContactGroup]) async -> Int {
+        isCleaningContacts = true
+        contactCleaningComplete = false
+        contactCleaningProgress = (0, groups.count)
+        var successCount = 0
+
+        let keys: [CNKeyDescriptor] = [
+            CNContactIdentifierKey as CNKeyDescriptor,
+            CNContactGivenNameKey as CNKeyDescriptor,
+            CNContactFamilyNameKey as CNKeyDescriptor,
+            CNContactPhoneNumbersKey as CNKeyDescriptor,
+            CNContactEmailAddressesKey as CNKeyDescriptor
+        ]
+
+        for (index, group) in groups.enumerated() {
+            contactCleaningProgress = (index, groups.count)
+
+            let keeperID = bestContactID(in: group)
+            let duplicateIDs = group.contacts.map(\.id).filter { $0 != keeperID }
+            guard !duplicateIDs.isEmpty else { continue }
+
+            do {
+                let keeperContact = try contactStore.unifiedContact(withIdentifier: keeperID, keysToFetch: keys)
+                guard let keeperMutable = keeperContact.mutableCopy() as? CNMutableContact else { continue }
+
+                var existingPhones = Set(keeperMutable.phoneNumbers.map { $0.value.stringValue.filter(\.isNumber) })
+                var existingEmails = Set(keeperMutable.emailAddresses.map { ($0.value as String).lowercased() })
+                let saveRequest = CNSaveRequest()
+
+                for identifier in duplicateIDs {
+                    let dup = try contactStore.unifiedContact(withIdentifier: identifier, keysToFetch: keys)
+                    for phone in dup.phoneNumbers {
+                        let normalized = phone.value.stringValue.filter(\.isNumber)
+                        if !normalized.isEmpty, existingPhones.insert(normalized).inserted {
+                            keeperMutable.phoneNumbers.append(phone.copy() as! CNLabeledValue<CNPhoneNumber>)
+                        }
+                    }
+                    for email in dup.emailAddresses {
+                        let normalized = (email.value as String).lowercased()
+                        if !normalized.isEmpty, existingEmails.insert(normalized).inserted {
+                            keeperMutable.emailAddresses.append(email.copy() as! CNLabeledValue<NSString>)
+                        }
+                    }
+                    if let deletable = dup.mutableCopy() as? CNMutableContact {
+                        saveRequest.delete(deletable)
+                    }
+                }
+
+                saveRequest.update(keeperMutable)
+                try contactStore.execute(saveRequest)
+                successCount += 1
+            } catch {
+                // Skip failed group, continue with rest
+            }
+        }
+
+        contactCleaningProgress = (groups.count, groups.count)
+        // Single rescan at end
+        await scanContacts()
+        isCleaningContacts = false
+        contactCleaningComplete = true
+        return successCount
+    }
+
+    /// Delete contacts by their IDs
+    func deleteContacts(ids: Set<String>) async -> Bool {
+        let keys: [CNKeyDescriptor] = [
+            CNContactIdentifierKey as CNKeyDescriptor
+        ]
         let saveRequest = CNSaveRequest()
 
         do {
-            for identifier in duplicateIDs {
+            for identifier in ids {
                 let contact = try contactStore.unifiedContact(withIdentifier: identifier, keysToFetch: keys)
                 if let mutable = contact.mutableCopy() as? CNMutableContact {
                     saveRequest.delete(mutable)
@@ -1209,6 +1380,11 @@ final class AppFlow: ObservableObject {
         } catch {
             return false
         }
+    }
+
+    func resetContactCleaningState() {
+        contactCleaningComplete = false
+        contactCleaningProgress = (0, 0)
     }
 
     func updateEmailPreferences(_ transform: (inout EmailCleanerPreferences) -> Void) {
@@ -1491,6 +1667,8 @@ final class AppFlow: ObservableObject {
         dashboardCategories = DashboardCategoryKind.allCases.map {
             DashboardCategorySummary(kind: $0, count: 0, totalBytes: 0)
         }
+        cachedCompressiblePhotos = []
+        cachedCompressibleVideos = []
         isScanningLibrary = false
         scanProgress = 0
         scanStatusText = "Photo access is required"
@@ -1503,41 +1681,86 @@ final class AppFlow: ObservableObject {
         similarBuckets: [String: [MediaAssetRecord]],
         similarVideoBuckets: [String: [MediaAssetRecord]],
         similarScreenshotBuckets: [String: [MediaAssetRecord]]
-    ) {
-        let duplicateClusters = makeClusters(from: duplicateBuckets, category: .duplicates)
-        let similarClusters = makeClusters(from: similarBuckets, category: .similar)
-        let similarVideoClusters = makeClusters(from: similarVideoBuckets, category: .similarVideos)
-        let similarScreenshotClusters = makeClusters(from: similarScreenshotBuckets, category: .similarScreenshots)
-        assertUniqueClusterMembership(in: duplicateClusters, category: .duplicates)
-        assertUniqueClusterMembership(in: similarClusters, category: .similar)
-        assertUniqueClusterMembership(in: similarVideoClusters, category: .similarVideos)
-        assertUniqueClusterMembership(in: similarScreenshotClusters, category: .similarScreenshots)
-
-        var workingCategorized = categorized
-        workingCategorized[.duplicates] = flattenClusters(duplicateClusters)
-        workingCategorized[.similar] = flattenClusters(similarClusters)
-        workingCategorized[.similarVideos] = flattenClusters(similarVideoClusters)
-        workingCategorized[.similarScreenshots] = flattenClusters(similarScreenshotClusters)
-
-        mediaAssetsByCategory = workingCategorized.mapValues { records in
-            records.sorted {
-                if $0.sizeInBytes == $1.sizeInBytes {
-                    return ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast)
-                }
-                return $0.sizeInBytes > $1.sizeInBytes
+    ) async {
+        // Move all heavy sorting/clustering OFF the main thread
+        let (newAssets, newClusters) = await Task.detached(priority: .userInitiated) {
+            func uniqueList(_ records: [MediaAssetRecord]) -> [MediaAssetRecord] {
+                var seen = Set<String>()
+                return records.filter { seen.insert($0.id).inserted }
             }
-        }
 
-        mediaClustersByCategory = [
-            .duplicates: duplicateClusters,
-            .similar: similarClusters,
-            .similarVideos: similarVideoClusters,
-            .similarScreenshots: similarScreenshotClusters,
-            .screenshots: makeClustersFromSortedAssets(workingCategorized[.screenshots, default: []], category: .screenshots, chunkSize: 12),
-            .other: makeClustersFromSortedAssets(workingCategorized[.other, default: []], category: .other, chunkSize: 12),
-            .videos: makeClustersFromSortedAssets(workingCategorized[.videos, default: []], category: .videos, chunkSize: 8)
-        ]
+            func buildClusters(from buckets: [String: [MediaAssetRecord]], category: DashboardCategoryKind) -> [MediaCluster] {
+                buckets.compactMap { key, value in
+                    let sorted = uniqueList(value).sorted {
+                        if $0.sizeInBytes == $1.sizeInBytes {
+                            return ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast)
+                        }
+                        return $0.sizeInBytes > $1.sizeInBytes
+                    }
+                    guard sorted.count > 1 else { return nil }
+                    return MediaCluster(id: key, category: category, assets: sorted, totalBytes: sorted.reduce(0) { $0 + $1.sizeInBytes }, subtitle: nil)
+                }
+                .sorted {
+                    if $0.totalBytes == $1.totalBytes { return $0.count > $1.count }
+                    return $0.totalBytes > $1.totalBytes
+                }
+            }
 
+            func flatten(_ clusters: [MediaCluster]) -> [MediaAssetRecord] {
+                uniqueList(clusters.flatMap(\.assets))
+            }
+
+            func chunkClusters(_ assets: [MediaAssetRecord], category: DashboardCategoryKind, chunkSize: Int) -> [MediaCluster] {
+                let sorted = assets.sorted {
+                    if $0.sizeInBytes == $1.sizeInBytes {
+                        return ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast)
+                    }
+                    return $0.sizeInBytes > $1.sizeInBytes
+                }
+                guard !sorted.isEmpty else { return [] }
+                return stride(from: 0, to: sorted.count, by: chunkSize).map { startIndex in
+                    let endIndex = min(startIndex + chunkSize, sorted.count)
+                    let chunk = Array(sorted[startIndex..<endIndex])
+                    return MediaCluster(id: "\(category.rawValue)-\(startIndex)", category: category, assets: chunk, totalBytes: chunk.reduce(0) { $0 + $1.sizeInBytes }, subtitle: nil)
+                }
+            }
+
+            let duplicateClusters = buildClusters(from: duplicateBuckets, category: .duplicates)
+            let similarClusters = buildClusters(from: similarBuckets, category: .similar)
+            let similarVideoClusters = buildClusters(from: similarVideoBuckets, category: .similarVideos)
+            let similarScreenshotClusters = buildClusters(from: similarScreenshotBuckets, category: .similarScreenshots)
+
+            var workingCategorized = categorized
+            workingCategorized[.duplicates] = flatten(duplicateClusters)
+            workingCategorized[.similar] = flatten(similarClusters)
+            workingCategorized[.similarVideos] = flatten(similarVideoClusters)
+            workingCategorized[.similarScreenshots] = flatten(similarScreenshotClusters)
+
+            let assets = workingCategorized.mapValues { records in
+                records.sorted {
+                    if $0.sizeInBytes == $1.sizeInBytes {
+                        return ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast)
+                    }
+                    return $0.sizeInBytes > $1.sizeInBytes
+                }
+            }
+
+            let clusters: [DashboardCategoryKind: [MediaCluster]] = [
+                .duplicates: duplicateClusters,
+                .similar: similarClusters,
+                .similarVideos: similarVideoClusters,
+                .similarScreenshots: similarScreenshotClusters,
+                .screenshots: chunkClusters(workingCategorized[.screenshots, default: []], category: .screenshots, chunkSize: 12),
+                .other: chunkClusters(workingCategorized[.other, default: []], category: .other, chunkSize: 12),
+                .videos: chunkClusters(workingCategorized[.videos, default: []], category: .videos, chunkSize: 8)
+            ]
+
+            return (assets, clusters)
+        }.value
+
+        // Only lightweight assignments on the main thread
+        mediaAssetsByCategory = newAssets
+        mediaClustersByCategory = newClusters
         refreshDashboardCategories()
     }
 
@@ -1550,6 +1773,12 @@ final class AppFlow: ObservableObject {
                 totalBytes: items.reduce(0) { $0 + $1.sizeInBytes }
             )
         }
+        rebuildCompressibleAssetCaches()
+    }
+
+    private func rebuildCompressibleAssetCaches() {
+        cachedCompressiblePhotos = compressibleAssets(of: .image)
+        cachedCompressibleVideos = compressibleAssets(of: .video)
     }
 
     private func removeDeletedAssetsFromState(_ identifiers: Set<String>) {
@@ -1780,10 +2009,11 @@ final class AppFlow: ObservableObject {
             ].joined(separator: "-")
         case .similarVideos:
             return [
-                Int(timestamp / (20 * 60)).description,
-                roundedValue(asset.pixelWidth, unit: 80).description,
-                Int(asset.duration / 4).description,
-                Int(asset.sizeInBytes / 4_000_000).description
+                Int(timestamp / (10 * 60)).description,
+                roundedValue(asset.pixelWidth, unit: 60).description,
+                roundedValue(asset.pixelHeight, unit: 60).description,
+                Int(asset.duration / 2).description,
+                Int(asset.sizeInBytes / 1_500_000).description
             ].joined(separator: "-")
         default:
             return [
@@ -1807,7 +2037,7 @@ final class AppFlow: ObservableObject {
         case .similarScreenshots:
             return delta <= 20 * 60
         case .similarVideos:
-            return delta <= 35 * 60
+            return delta <= 15 * 60
         default:
             return delta <= 45 * 60
         }
@@ -1825,7 +2055,7 @@ final class AppFlow: ObservableObject {
         case .similarScreenshots:
             return widthDelta <= 80 && heightDelta <= 80
         case .similarVideos:
-            return widthDelta <= 180 && heightDelta <= 180
+            return widthDelta <= 120 && heightDelta <= 120
         default:
             return widthDelta <= 120 && heightDelta <= 120
         }
@@ -1938,8 +2168,11 @@ final class AppFlow: ObservableObject {
             return cached
         }
 
-        guard let thumbnail = await requestClusterThumbnail(for: asset.id),
-              let signature = Self.makeVisualSignature(from: thumbnail)
+        // Use the larger 256×256 indexing thumbnail for better hash quality
+        // (especially important for videos where the 52×52 thumbnail is too small)
+        guard let sourceAsset = assetForLookupIdentifier(asset.id),
+              let thumbnail = await Self.requestIndexingThumbnail(for: sourceAsset),
+              let signature = Self.makeVisualSignature(from: thumbnail.uiImage)
         else {
             return nil
         }
@@ -2383,6 +2616,7 @@ final class AppFlow: ObservableObject {
         guard !newIDs.isEmpty else { return }
         retiredCompressionAssetIDs.formUnion(newIDs)
         persist(retiredCompressionAssetIDs, key: retiredCompressionAssetIDsKey)
+        rebuildCompressibleAssetCaches()
     }
 
     private func updateSecretVaultImportStatus(
@@ -2506,10 +2740,17 @@ final class AppFlow: ObservableObject {
     }
 
     private func similarVideoKey(for asset: PHAsset, size: Int64) -> String {
-        let dayBucket = Int((asset.creationDate?.timeIntervalSince1970 ?? 0) / 86_400)
-        let durationBucket = Int(asset.duration / 8)
-        let sizeBucket = Int(size / 5_000_000)
-        return [dayBucket.description, durationBucket.description, sizeBucket.description, roundedValue(asset.pixelWidth, unit: 240).description].joined(separator: "-")
+        // Tighter bucketing: 2-hour time window, 3-second duration, 2MB size, 120px resolution
+        let timeBucket = Int((asset.creationDate?.timeIntervalSince1970 ?? 0) / (2 * 3600))
+        let durationBucket = Int(asset.duration / 3)
+        let sizeBucket = Int(size / 2_000_000)
+        return [
+            timeBucket.description,
+            durationBucket.description,
+            sizeBucket.description,
+            roundedValue(asset.pixelWidth, unit: 120).description,
+            roundedValue(asset.pixelHeight, unit: 120).description
+        ].joined(separator: "-")
     }
 
     private func similarScreenshotKey(for asset: PHAsset) -> String {
