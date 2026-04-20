@@ -1508,26 +1508,16 @@ struct MediaCategoryReviewView: View {
                 .onPreferenceChange(DragSelectCellFrameKey.self) { frames in
                     dragSelect.cellFrames = frames
                 }
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 12, coordinateSpace: .named("screenshotGrid"))
-                        .onChanged { value in
-                            if !dragSelect.isDragging {
-                                dragSelect.orderedIDs = assets.map(\.id)
-                                dragSelect.dragBegan(at: value.startLocation, currentSelection: selectedAssetIDs)
-                            }
-                            if let newSelection = dragSelect.dragMoved(to: value.location) {
-                                selectedAssetIDs = newSelection
-                            }
-                        }
-                        .onEnded { _ in
-                            if let finalSelection = dragSelect.dragEnded() {
-                                selectedAssetIDs = finalSelection
-                            }
-                        }
-                )
+                .modifier(DragSelectGestureModifier(
+                    enabled: !flatGalleryIsVideo,
+                    coordinateSpace: "screenshotGrid",
+                    dragSelect: dragSelect,
+                    assets: assets,
+                    selectedAssetIDs: $selectedAssetIDs
+                ))
                 .padding(.bottom, 120)
             }
-            .scrollDisabled(dragSelect.isDragging)
+            .scrollDisabled(!flatGalleryIsVideo && dragSelect.isDragging)
 
             screenshotDeleteBar
         }
@@ -2880,6 +2870,38 @@ private struct ClusterDetailReviewView: View {
 
 private struct VideoPreviewRoute: Identifiable, Hashable {
     let id: String
+}
+
+private struct DragSelectGestureModifier: ViewModifier {
+    let enabled: Bool
+    let coordinateSpace: String
+    @ObservedObject var dragSelect: DragSelectState
+    let assets: [MediaAssetRecord]
+    @Binding var selectedAssetIDs: Set<String>
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.simultaneousGesture(
+                DragGesture(minimumDistance: 12, coordinateSpace: .named(coordinateSpace))
+                    .onChanged { value in
+                        if !dragSelect.isDragging {
+                            dragSelect.orderedIDs = assets.map(\.id)
+                            dragSelect.dragBegan(at: value.startLocation, currentSelection: selectedAssetIDs)
+                        }
+                        if let newSelection = dragSelect.dragMoved(to: value.location) {
+                            selectedAssetIDs = newSelection
+                        }
+                    }
+                    .onEnded { _ in
+                        if let finalSelection = dragSelect.dragEnded() {
+                            selectedAssetIDs = finalSelection
+                        }
+                    }
+            )
+        } else {
+            content
+        }
+    }
 }
 
 private struct VideoGalleryCell: View {
