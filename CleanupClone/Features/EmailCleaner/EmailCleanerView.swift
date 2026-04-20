@@ -210,37 +210,63 @@ struct EmailCleanerView: View {
         }
     }
 
+    private var selectAllIconName: String {
+        let loaded = currentCategoryMessages.map(\.id)
+        let allLoadedSelected = !loaded.isEmpty && selectedMessageIDs.isSuperset(of: loaded)
+        return allLoadedSelected ? "checkmark.circle.fill" : "circle"
+    }
+
+    private var selectAllButtonTitle: String {
+        let loaded = currentCategoryMessages.map(\.id)
+        let allLoadedSelected = !loaded.isEmpty && selectedMessageIDs.isSuperset(of: loaded)
+        return allLoadedSelected ? "Deselect all" : "Select all"
+    }
+
+    private var headerStatusText: String {
+        if !selectedMessageIDs.isEmpty {
+            return "\(selectedMessageIDs.count) selected"
+        }
+        // Show real-time count: "loaded / total", growing as pages come in.
+        let loaded = currentCategoryMessages.count
+        let total = max(currentCategoryTotalEstimate, loaded)
+        if loaded == 0 {
+            return "Loading..."
+        }
+        if currentCategoryNextPage == nil {
+            return "\(loaded) of \(loaded)"
+        }
+        return "\(loaded) of \(formattedCount(total))"
+    }
+
     // MARK: - Category detail (paginated list w/ multi-select)
 
     private var categoryDetailContent: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                if isSelectAllMode || !selectedMessageIDs.isEmpty {
-                    Button {
-                        if selectedMessageIDs.count == currentCategoryMessages.count {
-                            selectedMessageIDs.removeAll()
-                            isSelectAllMode = false
-                        } else {
-                            selectedMessageIDs = Set(currentCategoryMessages.map { $0.id })
-                            isSelectAllMode = true
-                        }
-                    } label: {
-                        Text(selectedMessageIDs.count == currentCategoryMessages.count && !currentCategoryMessages.isEmpty ? "Deselect all" : "Select all")
-                            .font(CleanupFont.body(14))
-                            .foregroundStyle(CleanupTheme.electricBlue)
+            HStack(spacing: 10) {
+                Button {
+                    let loaded = currentCategoryMessages.map(\.id)
+                    let allLoadedSelected = !loaded.isEmpty && selectedMessageIDs.isSuperset(of: loaded)
+                    if allLoadedSelected {
+                        selectedMessageIDs.removeAll()
+                    } else {
+                        selectedMessageIDs.formUnion(loaded)
                     }
-                    .buttonStyle(.plain)
-                } else {
-                    Text("Total: \(formattedCount(currentCategoryTotalEstimate))")
-                        .font(CleanupFont.body(13))
-                        .foregroundStyle(CleanupTheme.textSecondary)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: selectAllIconName)
+                            .font(.system(size: 15, weight: .semibold))
+                        Text(selectAllButtonTitle)
+                            .font(CleanupFont.body(14))
+                    }
+                    .foregroundStyle(CleanupTheme.electricBlue)
                 }
+                .buttonStyle(.plain)
+
                 Spacer()
-                if !selectedMessageIDs.isEmpty {
-                    Text("\(selectedMessageIDs.count) selected")
-                        .font(CleanupFont.caption(12))
-                        .foregroundStyle(CleanupTheme.textSecondary)
-                }
+
+                Text(headerStatusText)
+                    .font(CleanupFont.caption(12))
+                    .foregroundStyle(CleanupTheme.textSecondary)
             }
             .padding(.horizontal, 4)
 
@@ -319,19 +345,23 @@ struct EmailCleanerView: View {
 
     private func messageRow(_ message: GmailMessagePreview) -> some View {
         let isSelected = selectedMessageIDs.contains(message.id)
-        return Button {
-            if selectedMessageIDs.isEmpty && !isSelectAllMode {
-                // Tap opens detail
-                openDetail(messageID: message.id)
-            } else {
+        return HStack(spacing: 12) {
+            // Dedicated checkbox tap target — toggles selection only.
+            Button {
                 toggleSelection(message.id)
-            }
-        } label: {
-            HStack(spacing: 12) {
+            } label: {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 22))
+                    .font(.system(size: 24))
                     .foregroundStyle(isSelected ? CleanupTheme.electricBlue : CleanupTheme.textTertiary)
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
 
+            // Row body — tap opens the email preview.
+            Button {
+                openDetail(messageID: message.id)
+            } label: {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
                         Text(message.fromName)
@@ -357,15 +387,21 @@ struct EmailCleanerView: View {
                             .lineLimit(2)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            .padding(.vertical, 10)
-            .padding(.horizontal, 12)
-            .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.04)))
+            .buttonStyle(.plain)
         }
-        .buttonStyle(.plain)
-        .simultaneousGesture(LongPressGesture(minimumDuration: 0.3).onEnded { _ in
-            toggleSelection(message.id)
-        })
+        .padding(.vertical, 10)
+        .padding(.horizontal, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(isSelected ? CleanupTheme.electricBlue.opacity(0.12) : Color.white.opacity(0.04))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(isSelected ? CleanupTheme.electricBlue.opacity(0.5) : Color.clear, lineWidth: 1)
+        )
     }
 
     private func toggleSelection(_ id: String) {
