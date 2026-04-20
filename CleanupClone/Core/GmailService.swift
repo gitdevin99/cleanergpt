@@ -25,6 +25,8 @@ struct GmailSenderSummary: Identifiable, Hashable {
     let email: String
     let emailCount: Int
     let unsubscribeURL: URL?
+    let supportsOneClickPost: Bool
+    let mailtoUnsubscribe: URL?
 }
 
 struct GmailMailboxSnapshot: Hashable {
@@ -32,6 +34,40 @@ struct GmailMailboxSnapshot: Hashable {
     let categories: [GmailCategorySummary]
     let senders: [GmailSenderSummary]
     let syncedAt: Date
+}
+
+struct GmailMessagePreview: Identifiable, Hashable {
+    let id: String
+    let threadId: String
+    let fromName: String
+    let fromEmail: String
+    let subject: String
+    let snippet: String
+    let date: Date?
+    let isUnread: Bool
+}
+
+struct GmailMessagePage: Hashable {
+    let messages: [GmailMessagePreview]
+    let nextPageToken: String?
+    let totalEstimate: Int
+}
+
+struct GmailMessageDetail: Hashable {
+    let id: String
+    let fromName: String
+    let fromEmail: String
+    let subject: String
+    let date: Date?
+    let htmlBody: String?
+    let plainBody: String?
+}
+
+enum GmailUnsubscribeResult {
+    case oneClickPosted
+    case mailtoSent
+    case openURL(URL)
+    case notAvailable
 }
 
 enum GmailServiceError: LocalizedError {
@@ -266,11 +302,16 @@ final class GmailService {
                         name: sender.name,
                         email: sender.email,
                         sampleCount: 0,
-                        unsubscribeURL: nil
+                        unsubscribeURL: nil,
+                        supportsOneClickPost: false,
+                        mailtoUnsubscribe: nil
                     )
                     accumulator.sampleCount += 1
                     accumulator.name = sender.name
-                    accumulator.unsubscribeURL = accumulator.unsubscribeURL ?? parseUnsubscribeURL(from: metadata.payload.headers)
+                    let parsed = parseAllUnsubscribe(from: metadata.payload.headers)
+                    accumulator.unsubscribeURL = accumulator.unsubscribeURL ?? parsed.httpURL
+                    accumulator.mailtoUnsubscribe = accumulator.mailtoUnsubscribe ?? parsed.mailto
+                    accumulator.supportsOneClickPost = accumulator.supportsOneClickPost || parsed.oneClick
                     groupedSenders[sender.email.lowercased()] = accumulator
                 }
             }
@@ -302,7 +343,9 @@ final class GmailService {
                     name: candidate.name,
                     email: candidate.email,
                     emailCount: max(candidate.sampleCount, listResponse.resultSizeEstimate ?? candidate.sampleCount),
-                    unsubscribeURL: candidate.unsubscribeURL
+                    unsubscribeURL: candidate.unsubscribeURL ?? candidate.mailtoUnsubscribe,
+                    supportsOneClickPost: candidate.supportsOneClickPost,
+                    mailtoUnsubscribe: candidate.mailtoUnsubscribe
                 )
             )
         }
@@ -322,9 +365,325 @@ final class GmailService {
             queryItems: [
                 URLQueryItem(name: "format", value: "metadata"),
                 URLQueryItem(name: "metadataHeaders", value: "From"),
-                URLQueryItem(name: "metadataHeaders", value: "List-Unsubscribe")
+                URLQueryItem(name: "metadataHeaders", value: "Subject"),
+                URLQueryItem(name: "metadataHeaders", value: "Date"),
+                URLQueryItem(name: "metadataHeaders", value: "List-Unsubscribe"),
+                URLQueryItem(name: "metadataHeaders", value: "List-Unsubscribe-Post")
             ]
         )
+    }
+
+    // MARK: - Paginated message listing per label
+
+    func listMessages(
+        labelID: String,
+        pageToken: String?,
+        pageSize: Int = 50
+    ) async throws -> GmailMessagePage {
+        guard let currentUser = GIDSignIn.sharedInstance.currentUser else {
+            throw GmailServiceError.missingCurrentUser
+        }
+        let refreshed = try await refreshTokensIfNeeded(for: currentUser)
+        let accessToken = refreshed.accessToken.tokenString
+
+        var queryItems: [URLQueryItem] = [
+            URLQueryItem(name: "labelIds", value: labelID),
+            URLQueryItem(name: "maxResults", value: String(pageSize))
+        ]
+        if let pageToken {
+            queryItems.append(URLQueryItem(name: "pageToken", value: pageToken))
+        }
+
+        let listResponse: GmailMessageListResponse = try await request(
+            path: "users/me/messages",
+            accessToken: accessToken,
+            queryItems: queryItems
+        )
+
+        let ids = listResponse.messages ?? []
+        var previews: [GmailMessagePreview] = Array(repeating: placeholderPreview, count: ids.count)
+
+        try await withThrowingTaskGroup(of: (Int, GmailMessagePreview?).self) { group in
+            for (index, identifier) in ids.enumerated() {
+                group.addTask {
+                    let preview = try await self.fetchMessagePreview(
+                        accessToken: accessToken,
+                        messageID: identifier.id
+                    )
+                    return (index, preview)
+                }
+            }
+            for try await (index, preview) in group {
+                if let preview {
+                    previews[index] = preview
+                }
+            }
+        }
+
+        previews.removeAll { $0.id.isEmpty }
+
+        return GmailMessagePage(
+            messages: previews,
+            nextPageToken: listResponse.nextPageToken,
+            totalEstimate: listResponse.resultSizeEstimate ?? previews.count
+        )
+    }
+
+    private var placeholderPreview: GmailMessagePreview {
+        GmailMessagePreview(id: "", threadId: "", fromName: "", fromEmail: "", subject: "", snippet: "", date: nil, isUnread: false)
+    }
+
+    private func fetchMessagePreview(accessToken: String, messageID: String) async throws -> GmailMessagePreview? {
+        var components = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages/\(messageID)")!
+        components.queryItems = [
+            URLQueryItem(name: "format", value: "metadata"),
+            URLQueryItem(name: "metadataHeaders", value: "From"),
+            URLQueryItem(name: "metadataHeaders", value: "Subject"),
+            URLQueryItem(name: "metadataHeaders", value: "Date")
+        ]
+        var request = URLRequest(url: components.url!)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            return nil
+        }
+
+        let decoded = try JSONDecoder().decode(GmailMessageFullResponse.self, from: data)
+        let headers = decoded.payload?.headers ?? []
+        let sender = parseSender(from: headers)
+        let subject = headers.first { $0.name.caseInsensitiveCompare("Subject") == .orderedSame }?.value ?? "(no subject)"
+        let dateString = headers.first { $0.name.caseInsensitiveCompare("Date") == .orderedSame }?.value
+        let date = dateString.flatMap(parseRFC2822Date)
+        let isUnread = (decoded.labelIds ?? []).contains("UNREAD")
+
+        return GmailMessagePreview(
+            id: decoded.id,
+            threadId: decoded.threadId ?? decoded.id,
+            fromName: sender?.name ?? "(unknown)",
+            fromEmail: sender?.email ?? "",
+            subject: subject,
+            snippet: decoded.snippet ?? "",
+            date: date,
+            isUnread: isUnread
+        )
+    }
+
+    // MARK: - Message detail (full body)
+
+    func fetchMessageDetail(messageID: String) async throws -> GmailMessageDetail {
+        guard let currentUser = GIDSignIn.sharedInstance.currentUser else {
+            throw GmailServiceError.missingCurrentUser
+        }
+        let refreshed = try await refreshTokensIfNeeded(for: currentUser)
+        let accessToken = refreshed.accessToken.tokenString
+
+        let response: GmailMessageFullResponse = try await request(
+            path: "users/me/messages/\(messageID)",
+            accessToken: accessToken,
+            queryItems: [URLQueryItem(name: "format", value: "full")]
+        )
+
+        let headers = response.payload?.headers ?? []
+        let sender = parseSender(from: headers)
+        let subject = headers.first { $0.name.caseInsensitiveCompare("Subject") == .orderedSame }?.value ?? "(no subject)"
+        let dateString = headers.first { $0.name.caseInsensitiveCompare("Date") == .orderedSame }?.value
+        let date = dateString.flatMap(parseRFC2822Date)
+
+        let (html, plain) = extractBodies(from: response.payload)
+
+        return GmailMessageDetail(
+            id: response.id,
+            fromName: sender?.name ?? "(unknown)",
+            fromEmail: sender?.email ?? "",
+            subject: subject,
+            date: date,
+            htmlBody: html,
+            plainBody: plain
+        )
+    }
+
+    private func extractBodies(from payload: GmailPayloadFull?) -> (String?, String?) {
+        guard let payload else { return (nil, nil) }
+        var html: String?
+        var plain: String?
+        walk(payload, html: &html, plain: &plain)
+        return (html, plain)
+    }
+
+    private func walk(_ part: GmailPayloadFull, html: inout String?, plain: inout String?) {
+        let mime = (part.mimeType ?? "").lowercased()
+        if mime == "text/html", html == nil, let body = decodeBody(part.body?.data) {
+            html = body
+        } else if mime == "text/plain", plain == nil, let body = decodeBody(part.body?.data) {
+            plain = body
+        }
+        for child in part.parts ?? [] {
+            walk(child, html: &html, plain: &plain)
+        }
+    }
+
+    private func decodeBody(_ base64url: String?) -> String? {
+        guard var value = base64url, !value.isEmpty else { return nil }
+        value = value.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while value.count % 4 != 0 { value.append("=") }
+        guard let data = Data(base64Encoded: value) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func parseRFC2822Date(_ raw: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        let formats = [
+            "EEE, d MMM yyyy HH:mm:ss Z",
+            "d MMM yyyy HH:mm:ss Z",
+            "EEE, d MMM yyyy HH:mm:ss zzz"
+        ]
+        for format in formats {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: raw) { return date }
+        }
+        return nil
+    }
+
+    // MARK: - Batch trash / archive
+
+    func trashMessages(ids: [String]) async throws {
+        try await modifyMessages(ids: ids, addLabelIds: ["TRASH"], removeLabelIds: [])
+    }
+
+    func archiveMessages(ids: [String]) async throws {
+        try await modifyMessages(ids: ids, addLabelIds: [], removeLabelIds: ["INBOX"])
+    }
+
+    private func modifyMessages(ids: [String], addLabelIds: [String], removeLabelIds: [String]) async throws {
+        guard !ids.isEmpty else { return }
+        guard let currentUser = GIDSignIn.sharedInstance.currentUser else {
+            throw GmailServiceError.missingCurrentUser
+        }
+        let refreshed = try await refreshTokensIfNeeded(for: currentUser)
+        let accessToken = refreshed.accessToken.tokenString
+
+        // Gmail batchModify caps at 1000 ids.
+        let chunks = stride(from: 0, to: ids.count, by: 900).map { Array(ids[$0..<min($0 + 900, ids.count)]) }
+        for chunk in chunks {
+            let url = URL(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify")!
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let body: [String: Any] = [
+                "ids": chunk,
+                "addLabelIds": addLabelIds,
+                "removeLabelIds": removeLabelIds
+            ]
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                let message = String(data: data, encoding: .utf8) ?? "Gmail batchModify failed"
+                throw NSError(domain: "GmailService", code: (response as? HTTPURLResponse)?.statusCode ?? -1, userInfo: [NSLocalizedDescriptionKey: message])
+            }
+        }
+    }
+
+    // MARK: - One-click unsubscribe
+
+    func unsubscribe(sender: GmailSenderSummary) async throws -> GmailUnsubscribeResult {
+        if sender.supportsOneClickPost, let url = sender.unsubscribeURL, let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http" {
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            request.httpBody = "List-Unsubscribe=One-Click".data(using: .utf8)
+            let (_, response) = try await session.data(for: request)
+            if let http = response as? HTTPURLResponse, (200..<400).contains(http.statusCode) {
+                return .oneClickPosted
+            }
+            return .openURL(url)
+        }
+
+        if let mailto = sender.mailtoUnsubscribe {
+            try await sendMailtoUnsubscribe(mailto: mailto)
+            return .mailtoSent
+        }
+
+        if let url = sender.unsubscribeURL {
+            return .openURL(url)
+        }
+        return .notAvailable
+    }
+
+    private func sendMailtoUnsubscribe(mailto: URL) async throws {
+        // Parse "mailto:addr?subject=unsubscribe&body=..."
+        guard let comps = URLComponents(url: mailto, resolvingAgainstBaseURL: false), let path = comps.path.isEmpty ? nil : comps.path as String? else {
+            return
+        }
+        let to = path
+        let subject = comps.queryItems?.first(where: { $0.name.lowercased() == "subject" })?.value ?? "unsubscribe"
+        let body = comps.queryItems?.first(where: { $0.name.lowercased() == "body" })?.value ?? "unsubscribe"
+
+        guard let currentUser = GIDSignIn.sharedInstance.currentUser else {
+            throw GmailServiceError.missingCurrentUser
+        }
+        let refreshed = try await refreshTokensIfNeeded(for: currentUser)
+        let accessToken = refreshed.accessToken.tokenString
+        let fromEmail = refreshed.profile?.email ?? ""
+
+        let raw = """
+        From: \(fromEmail)\r
+        To: \(to)\r
+        Subject: \(subject)\r
+        MIME-Version: 1.0\r
+        Content-Type: text/plain; charset=UTF-8\r
+        \r
+        \(body)
+        """
+
+        let encoded = Data(raw.utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+
+        let url = URL(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages/send")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["raw": encoded])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let message = String(data: data, encoding: .utf8) ?? "Gmail send failed"
+            throw NSError(domain: "GmailService", code: (response as? HTTPURLResponse)?.statusCode ?? -1, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+    }
+
+    func trashAllFromSender(_ email: String) async throws -> Int {
+        guard let currentUser = GIDSignIn.sharedInstance.currentUser else {
+            throw GmailServiceError.missingCurrentUser
+        }
+        let refreshed = try await refreshTokensIfNeeded(for: currentUser)
+        let accessToken = refreshed.accessToken.tokenString
+
+        var allIDs: [String] = []
+        var pageToken: String?
+        repeat {
+            var queryItems: [URLQueryItem] = [
+                URLQueryItem(name: "q", value: "from:\(email)"),
+                URLQueryItem(name: "maxResults", value: "500")
+            ]
+            if let pageToken { queryItems.append(URLQueryItem(name: "pageToken", value: pageToken)) }
+            let response: GmailMessageListResponse = try await request(
+                path: "users/me/messages",
+                accessToken: accessToken,
+                queryItems: queryItems
+            )
+            allIDs.append(contentsOf: (response.messages ?? []).map { $0.id })
+            pageToken = response.nextPageToken
+        } while pageToken != nil && allIDs.count < 5000
+
+        try await trashMessages(ids: allIDs)
+        return allIDs.count
     }
 
     private func request<Response: Decodable>(
@@ -368,21 +727,27 @@ final class GmailService {
     }
 
     private func parseUnsubscribeURL(from headers: [GmailHeader]) -> URL? {
-        guard let rawValue = headers.first(where: { $0.name.caseInsensitiveCompare("List-Unsubscribe") == .orderedSame })?.value else {
-            return nil
-        }
+        parseAllUnsubscribe(from: headers).httpURL ?? parseAllUnsubscribe(from: headers).mailto
+    }
 
+    private func parseAllUnsubscribe(from headers: [GmailHeader]) -> (httpURL: URL?, mailto: URL?, oneClick: Bool) {
+        let rawValue = headers.first { $0.name.caseInsensitiveCompare("List-Unsubscribe") == .orderedSame }?.value
+        let postHeader = headers.first { $0.name.caseInsensitiveCompare("List-Unsubscribe-Post") == .orderedSame }?.value
+        let oneClick = (postHeader ?? "").lowercased().contains("one-click")
+
+        guard let rawValue else { return (nil, nil, false) }
         let fragments = rawValue
             .split(separator: ",")
-            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " <>")) }
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " <>\t")) }
 
+        var http: URL?
+        var mailto: URL?
         for fragment in fragments {
-            if let url = URL(string: fragment), ["https", "http", "mailto"].contains(url.scheme?.lowercased() ?? "") {
-                return url
-            }
+            guard let url = URL(string: fragment), let scheme = url.scheme?.lowercased() else { continue }
+            if (scheme == "https" || scheme == "http"), http == nil { http = url }
+            if scheme == "mailto", mailto == nil { mailto = url }
         }
-
-        return nil
+        return (http, mailto, oneClick)
     }
 }
 
@@ -391,6 +756,8 @@ private struct SenderAccumulator {
     var email: String
     var sampleCount: Int
     var unsubscribeURL: URL?
+    var supportsOneClickPost: Bool
+    var mailtoUnsubscribe: URL?
 }
 
 private struct ParsedSender {
@@ -410,6 +777,7 @@ private struct GmailLabel: Decodable {
 private struct GmailMessageListResponse: Decodable {
     let messages: [GmailMessageIdentifier]?
     let resultSizeEstimate: Int?
+    let nextPageToken: String?
 }
 
 private struct GmailMessageIdentifier: Decodable {
@@ -427,4 +795,24 @@ private struct GmailPayload: Decodable {
 private struct GmailHeader: Decodable {
     let name: String
     let value: String
+}
+
+private struct GmailMessageFullResponse: Decodable {
+    let id: String
+    let threadId: String?
+    let snippet: String?
+    let labelIds: [String]?
+    let payload: GmailPayloadFull?
+}
+
+private struct GmailPayloadFull: Decodable {
+    let mimeType: String?
+    let headers: [GmailHeader]?
+    let body: GmailBody?
+    let parts: [GmailPayloadFull]?
+}
+
+private struct GmailBody: Decodable {
+    let data: String?
+    let size: Int?
 }
