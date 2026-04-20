@@ -602,6 +602,7 @@ struct VideoPlayerView: View {
     @State private var isPlaying = false
     @State private var showControls = true
     @State private var controlTimer: Task<Void, Never>?
+    @State private var currentLoadIdentifier: String?
 
     init(localIdentifier: String, autoPlay: Bool = true) {
         self.localIdentifier = localIdentifier
@@ -611,14 +612,19 @@ struct VideoPlayerView: View {
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(Color.white.opacity(0.04))
+                .fill(Color.black)
+
+            // Thumbnail underlay so the user sees the first frame
+            // immediately while the AVPlayer warms up.
+            PhotoThumbnailView(localIdentifier: localIdentifier, targetPointSize: 900)
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .opacity(player == nil ? 1 : 0)
 
             if let player {
                 VideoPlayerLayer(player: player)
                     .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
                     .onTapGesture { toggleControls() }
 
-                // Play/Pause overlay
                 if showControls {
                     Button {
                         togglePlayback()
@@ -631,7 +637,9 @@ struct VideoPlayerView: View {
                     .buttonStyle(.plain)
                     .transition(.opacity)
                 }
-            } else if isLoading {
+            }
+
+            if isLoading && player == nil {
                 ProgressView()
                     .tint(.white.opacity(0.8))
             }
@@ -639,65 +647,75 @@ struct VideoPlayerView: View {
         .task(id: localIdentifier) {
             await loadVideo(for: localIdentifier)
         }
+        .onChange(of: autoPlay) { _, newValue in
+            guard let player else { return }
+            if newValue {
+                player.play()
+                isPlaying = true
+                scheduleControlHide()
+            } else {
+                player.pause()
+                isPlaying = false
+            }
+        }
         .onDisappear {
             controlTimer?.cancel()
             player?.pause()
             player = nil
+            currentLoadIdentifier = nil
         }
     }
 
     private func loadVideo(for identifier: String) async {
+        currentLoadIdentifier = identifier
         isLoading = true
         player?.pause()
         player = nil
 
-        guard let phAsset = await MainActor.run(body: {
-            PhotoAssetLookup.shared.asset(for: identifier) ?? fallbackAsset(for: identifier)
-        }) else {
+        // Try the prefetch cache first — this is the fast path when the
+        // user swipes to a neighbor we've already warmed up.
+        if let cached = await VideoPrefetcher.shared.take(for: identifier) {
+            guard currentLoadIdentifier == identifier else { return }
+            attach(playerItem: cached, identifier: identifier)
+            return
+        }
+
+        guard let phAsset = PhotoAssetLookup.shared.asset(for: identifier) ?? fallbackAsset(for: identifier) else {
             isLoading = false
             return
         }
 
-        let options = PHVideoRequestOptions()
-        options.isNetworkAccessAllowed = true
-        options.deliveryMode = .automatic
+        let item = await VideoPrefetcher.shared.makePlayerItem(for: phAsset)
+        guard currentLoadIdentifier == identifier else { return }
+        if let item {
+            attach(playerItem: item, identifier: identifier)
+        } else {
+            isLoading = false
+        }
+    }
 
-        await withCheckedContinuation { continuation in
-            var didResume = false
-            PHCachingImageManager.default().requestAVAsset(forVideo: phAsset, options: options) { avAsset, _, _ in
-                Task { @MainActor in
-                    if let avAsset {
-                        let playerItem = AVPlayerItem(asset: avAsset)
-                        let newPlayer = AVPlayer(playerItem: playerItem)
-                        newPlayer.isMuted = true
-                        self.player = newPlayer
-                        self.isLoading = false
+    private func attach(playerItem: AVPlayerItem, identifier: String) {
+        playerItem.preferredForwardBufferDuration = 1.0
+        let newPlayer = AVPlayer(playerItem: playerItem)
+        newPlayer.isMuted = true
+        newPlayer.automaticallyWaitsToMinimizeStalling = false
+        newPlayer.actionAtItemEnd = .none
 
-                        // Loop playback
-                        NotificationCenter.default.addObserver(
-                            forName: .AVPlayerItemDidPlayToEndTime,
-                            object: playerItem,
-                            queue: .main
-                        ) { _ in
-                            newPlayer.seek(to: .zero)
-                            newPlayer.play()
-                        }
+        NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: playerItem,
+            queue: .main
+        ) { [weak newPlayer] _ in
+            newPlayer?.seek(to: .zero)
+            newPlayer?.play()
+        }
 
-                        if autoPlay {
-                            newPlayer.play()
-                            isPlaying = true
-                            scheduleControlHide()
-                        }
-                    } else {
-                        self.isLoading = false
-                    }
-
-                    if !didResume {
-                        didResume = true
-                        continuation.resume()
-                    }
-                }
-            }
+        player = newPlayer
+        isLoading = false
+        if autoPlay {
+            newPlayer.play()
+            isPlaying = true
+            scheduleControlHide()
         }
     }
 
@@ -762,6 +780,99 @@ private struct VideoPlayerLayer: UIViewRepresentable {
     final class PlayerUIView: UIView {
         override class var layerClass: AnyClass { AVPlayerLayer.self }
         var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+    }
+}
+
+// MARK: - Video Prefetcher
+
+/// Warms up `AVPlayerItem`s for soon-to-be-visible videos so swiping between
+/// neighbors feels instant. The `VideoPlayerView` consumes an item via
+/// `take(for:)` on first load and falls back to a fresh request if absent.
+/// Transfer box to carry a non-Sendable `AVAsset` across a continuation.
+/// Safe because we only read it once and immediately hand it to AVPlayerItem.
+private struct AVAssetBox: @unchecked Sendable {
+    let asset: AVAsset
+    init(_ asset: AVAsset) { self.asset = asset }
+}
+
+@MainActor
+final class VideoPrefetcher {
+    static let shared = VideoPrefetcher()
+
+    private var cache: [String: AVPlayerItem] = [:]
+    private var inflight: Set<String> = []
+    private let maxCached = 6
+
+    private init() {}
+
+    func take(for identifier: String) -> AVPlayerItem? {
+        cache.removeValue(forKey: identifier)
+    }
+
+    func prefetch(identifiers: [String]) {
+        for id in identifiers {
+            guard cache[id] == nil, !inflight.contains(id) else { continue }
+            inflight.insert(id)
+            Task { [weak self] in
+                guard let self else { return }
+                guard let asset = PhotoAssetLookup.shared.asset(for: id) ?? Self.fallbackAsset(for: id) else {
+                    await MainActor.run { self.inflight.remove(id) }
+                    return
+                }
+                let item = await self.makePlayerItem(for: asset)
+                await MainActor.run {
+                    self.inflight.remove(id)
+                    guard let item else { return }
+                    self.cache[id] = item
+                    self.evictIfNeeded(keep: id)
+                }
+            }
+        }
+    }
+
+    func keep(_ keepIDs: Set<String>) {
+        for key in cache.keys where !keepIDs.contains(key) {
+            cache.removeValue(forKey: key)
+        }
+    }
+
+    private func evictIfNeeded(keep recentID: String) {
+        guard cache.count > maxCached else { return }
+        for key in cache.keys where key != recentID {
+            cache.removeValue(forKey: key)
+            if cache.count <= maxCached { break }
+        }
+    }
+
+    /// Requests an `AVAsset` from Photos, preloads the keys that matter for
+    /// first-frame decode, and returns a ready-to-attach `AVPlayerItem`.
+    /// Local assets are preferred — iCloud fetches are still allowed but
+    /// `.fastFormat` avoids pulling the original when a cheaper version works.
+    nonisolated func makePlayerItem(for phAsset: PHAsset) async -> AVPlayerItem? {
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .fastFormat
+        options.version = .current
+
+        let box: AVAssetBox? = await withCheckedContinuation { continuation in
+            PHCachingImageManager.default().requestAVAsset(forVideo: phAsset, options: options) { asset, _, _ in
+                continuation.resume(returning: asset.map(AVAssetBox.init))
+            }
+        }
+        guard let avAsset = box?.asset else { return nil }
+
+        _ = try? await avAsset.load(.tracks, .duration, .isPlayable)
+        let carrier = AVAssetBox(avAsset)
+        return await MainActor.run {
+            let item = AVPlayerItem(asset: carrier.asset)
+            item.preferredForwardBufferDuration = 1.0
+            return item
+        }
+    }
+
+    private static func fallbackAsset(for identifier: String) -> PHAsset? {
+        let result = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+        return result.firstObject
     }
 }
 

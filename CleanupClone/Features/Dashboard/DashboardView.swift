@@ -3090,6 +3090,10 @@ private struct VideoZoomPreviewSheet: View {
         }
         .onAppear {
             currentIndex = max(assets.firstIndex(where: { $0.id == initialAssetID }) ?? 0, 0)
+            prefetchNeighbors()
+        }
+        .onChange(of: currentIndex) { _, _ in
+            prefetchNeighbors()
         }
     }
 
@@ -3110,6 +3114,21 @@ private struct VideoZoomPreviewSheet: View {
         } else {
             selectedAssetIDs.insert(currentAsset.id)
         }
+    }
+
+    private func prefetchNeighbors() {
+        var ids: [String] = []
+        for offset in [-2, -1, 1, 2] {
+            let idx = currentIndex + offset
+            guard assets.indices.contains(idx), assets[idx].mediaType == .video else { continue }
+            ids.append(assets[idx].id)
+        }
+        VideoPrefetcher.shared.prefetch(identifiers: ids)
+
+        // Keep a small window around the current index; drop the rest.
+        var keep = Set(ids)
+        if let current = currentAsset { keep.insert(current.id) }
+        VideoPrefetcher.shared.keep(keep)
     }
 
     private func formattedDuration(_ value: TimeInterval) -> String {
@@ -3203,7 +3222,24 @@ private struct ClusterZoomPreviewSheet: View {
         }
         .onAppear {
             currentIndex = max(assets.firstIndex(where: { $0.id == initialAssetID }) ?? 0, 0)
+            prefetchNeighbors()
         }
+        .onChange(of: currentIndex) { _, _ in
+            prefetchNeighbors()
+        }
+    }
+
+    private func prefetchNeighbors() {
+        var ids: [String] = []
+        for offset in [-2, -1, 1, 2] {
+            let idx = currentIndex + offset
+            guard assets.indices.contains(idx), assets[idx].mediaType == .video else { continue }
+            ids.append(assets[idx].id)
+        }
+        VideoPrefetcher.shared.prefetch(identifiers: ids)
+        var keep = Set(ids)
+        if let current = currentAsset { keep.insert(current.id) }
+        VideoPrefetcher.shared.keep(keep)
     }
 
     private var currentAsset: MediaAssetRecord? {
