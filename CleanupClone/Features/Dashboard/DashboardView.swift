@@ -44,9 +44,10 @@ struct DashboardView: View {
     }
 
     private var videoCategories: [DashboardCategorySummary] {
-        appFlow.dashboardCategories.filter {
-            [.videos, .similarVideos].contains($0.kind)
-        }
+        let order: [DashboardCategoryKind] = [.similarVideos, .shortRecordings, .screenRecordings, .videos]
+        return order
+            .map { kind in summary(for: kind) }
+            .filter { $0.count > 0 }
     }
 
     private func summary(for kind: DashboardCategoryKind) -> DashboardCategorySummary {
@@ -1014,7 +1015,9 @@ struct SmartCleaningView: View {
             }
 
             return [
-                SmartCleanRow(id: "videos-similar", panel: .videos, kind: .media, title: "Similar Videos", subtitle: nil, value: "\(summary(for: .similarVideos).count)", isEnabled: summary(for: .similarVideos).count > 0, showsDivider: true, category: .similarVideos),
+                SmartCleanRow(id: "videos-similar", panel: .videos, kind: .media, title: "Duplicates", subtitle: nil, value: "\(summary(for: .similarVideos).count)", isEnabled: summary(for: .similarVideos).count > 0, showsDivider: true, category: .similarVideos),
+                SmartCleanRow(id: "videos-short", panel: .videos, kind: .media, title: "Short Recordings", subtitle: nil, value: "\(summary(for: .shortRecordings).count)", isEnabled: summary(for: .shortRecordings).count > 0, showsDivider: true, category: .shortRecordings),
+                SmartCleanRow(id: "videos-screen", panel: .videos, kind: .media, title: "Screen Recordings", subtitle: nil, value: "\(summary(for: .screenRecordings).count)", isEnabled: summary(for: .screenRecordings).count > 0, showsDivider: true, category: .screenRecordings),
                 SmartCleanRow(id: "videos-all", panel: .videos, kind: .media, title: "All Videos", subtitle: nil, value: "\(summary(for: .videos).count)", isEnabled: summary(for: .videos).count > 0, showsDivider: false, category: .videos)
             ]
         case .contacts:
@@ -1222,6 +1225,13 @@ struct MediaCategoryReviewView: View {
 
     private var usesFlatScreenshotGallery: Bool {
         category == .screenshots
+            || category == .videos
+            || category == .shortRecordings
+            || category == .screenRecordings
+    }
+
+    private var flatGalleryIsVideo: Bool {
+        category == .videos || category == .shortRecordings || category == .screenRecordings
     }
 
     private var selectedDeletionIDs: [String] {
@@ -1459,11 +1469,19 @@ struct MediaCategoryReviewView: View {
                         Button {
                             toggleScreenshotSelection(asset.id)
                         } label: {
-                            ScreenshotGalleryCell(
-                                asset: asset,
-                                isSelected: selectedAssetIDs.contains(asset.id),
-                                accent: accentColor
-                            )
+                            if flatGalleryIsVideo {
+                                VideoGalleryCell(
+                                    asset: asset,
+                                    isSelected: selectedAssetIDs.contains(asset.id),
+                                    accent: accentColor
+                                )
+                            } else {
+                                ScreenshotGalleryCell(
+                                    asset: asset,
+                                    isSelected: selectedAssetIDs.contains(asset.id),
+                                    accent: accentColor
+                                )
+                            }
                         }
                         .buttonStyle(.plain)
                         .modifier(DragSelectCellModifier(id: asset.id, coordinateSpace: "screenshotGrid"))
@@ -1561,7 +1579,8 @@ struct MediaCategoryReviewView: View {
     }
 
     private var screenshotDeleteBar: some View {
-        PrimaryCTAButton(title: selectedAssetIDs.isEmpty ? "Delete Selected" : "Delete \(selectedAssetIDs.count) Screenshots") {
+        let noun = flatGalleryIsVideo ? "Videos" : "Screenshots"
+        return PrimaryCTAButton(title: selectedAssetIDs.isEmpty ? "Delete Selected" : "Delete \(selectedAssetIDs.count) \(noun)") {
             Task {
                 guard !selectedDeletionIDs.isEmpty else { return }
                 isDeleting = true
@@ -2838,6 +2857,70 @@ private struct ClusterDetailReviewView: View {
         let upperBound = min(index + radius, assets.count - 1)
         guard lowerBound <= upperBound else { return [] }
         return Array(assets[lowerBound...upperBound]).map(\.id)
+    }
+}
+
+private struct VideoGalleryCell: View {
+    let asset: MediaAssetRecord
+    let isSelected: Bool
+    let accent: Color
+
+    private var durationLabel: String {
+        let total = Int(asset.duration.rounded())
+        let minutes = total / 60
+        let seconds = total % 60
+        return String(format: "%02d:%02d", minutes, seconds)
+    }
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            PhotoThumbnailView(localIdentifier: asset.id, targetPointSize: 220)
+                .aspectRatio(1, contentMode: .fill)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(alignment: .topLeading) {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(6)
+                        .background(Circle().fill(Color.black.opacity(0.55)))
+                        .padding(6)
+                }
+                .overlay(alignment: .topTrailing) {
+                    Text(durationLabel)
+                        .font(CleanupFont.caption(11))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .padding(6)
+                }
+                .overlay {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .shadow(color: .black.opacity(0.6), radius: 4)
+                }
+
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(isSelected ? accent : Color.black.opacity(0.38))
+                .frame(width: 26, height: 26)
+                .overlay {
+                    if isSelected {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(.white)
+                    }
+                }
+                .padding(.top, 34)
+                .padding(.trailing, 8)
+        }
+        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(isSelected ? accent : Color.white.opacity(0.05), lineWidth: isSelected ? 2 : 1)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }
 

@@ -56,6 +56,8 @@ enum DashboardCategoryKind: String, CaseIterable, Identifiable, Hashable {
     case screenshots
     case other
     case videos
+    case shortRecordings
+    case screenRecordings
 
     var id: String { rawValue }
 
@@ -63,11 +65,13 @@ enum DashboardCategoryKind: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .duplicates: "Duplicates"
         case .similar: "Similar"
-        case .similarVideos: "Similar Videos"
+        case .similarVideos: "Duplicates"
         case .similarScreenshots: "Similar Screenshots"
         case .screenshots: "Screenshots"
         case .other: "Other"
         case .videos: "Videos"
+        case .shortRecordings: "Short Recordings"
+        case .screenRecordings: "Screen Recordings"
         }
     }
 
@@ -75,11 +79,13 @@ enum DashboardCategoryKind: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .duplicates: "No duplicates found"
         case .similar: "No similar photos found"
-        case .similarVideos: "No similar videos found"
+        case .similarVideos: "No video duplicates found"
         case .similarScreenshots: "No similar screenshots found"
         case .screenshots: "No screenshots found"
         case .other: "No extra media found"
         case .videos: "No videos found"
+        case .shortRecordings: "No short recordings found"
+        case .screenRecordings: "No screen recordings found"
         }
     }
 
@@ -99,6 +105,10 @@ enum DashboardCategoryKind: String, CaseIterable, Identifiable, Hashable {
             [Color(hex: "#2B2E2F"), Color(hex: "#525B50")]
         case .videos:
             [Color(hex: "#101524"), Color(hex: "#0D0F17")]
+        case .shortRecordings:
+            [Color(hex: "#111827"), Color(hex: "#1E2A44")]
+        case .screenRecordings:
+            [Color(hex: "#0E1B1B"), Color(hex: "#143232")]
         }
     }
 
@@ -111,6 +121,8 @@ enum DashboardCategoryKind: String, CaseIterable, Identifiable, Hashable {
         case .screenshots: 206
         case .other: 206
         case .videos: 220
+        case .shortRecordings: 220
+        case .screenRecordings: 220
         }
     }
 
@@ -123,6 +135,8 @@ enum DashboardCategoryKind: String, CaseIterable, Identifiable, Hashable {
         case .screenshots: Color(hex: "#D39AB3")
         case .other: Color(hex: "#A8BDA2")
         case .videos: Color(hex: "#53DBFF")
+        case .shortRecordings: Color(hex: "#7DD3FC")
+        case .screenRecordings: Color(hex: "#34D399")
         }
     }
 }
@@ -209,7 +223,7 @@ struct DashboardCategorySummary: Identifiable, Hashable {
 
     var badgeTitle: String {
         switch kind {
-        case .similarVideos, .videos:
+        case .similarVideos, .videos, .shortRecordings, .screenRecordings:
             "\(count) Videos"
         default:
             "\(count) Photos"
@@ -234,7 +248,7 @@ struct MediaCluster: Identifiable, Hashable {
 
     var title: String {
         switch category {
-        case .videos, .similarVideos:
+        case .videos, .similarVideos, .shortRecordings, .screenRecordings:
             count == 1 ? "1 Video" : "\(count) Videos"
         default:
             count == 1 ? "1 Photo" : "\(count) Photos"
@@ -992,9 +1006,18 @@ final class AppFlow: ObservableObject {
             }
 
             if record.mediaType == .video {
-                categorized[.videos, default: []].append(record)
                 let videoKey = similarVideoKey(for: asset, size: record.sizeInBytes)
                 similarVideoBuckets[videoKey, default: []].append(record)
+                // Stash preliminary bucket. `applyLibrarySnapshot` will
+                // re-route to exactly one of: similarVideos, screenRecordings,
+                // shortRecordings, videos using priority rules.
+                if isScreenRecordingAsset(asset) {
+                    categorized[.screenRecordings, default: []].append(record)
+                } else if asset.duration > 0, asset.duration < 10 {
+                    categorized[.shortRecordings, default: []].append(record)
+                } else {
+                    categorized[.videos, default: []].append(record)
+                }
             } else {
                 categorized[.other, default: []].append(record)
 
@@ -1736,6 +1759,15 @@ final class AppFlow: ObservableObject {
             workingCategorized[.similarVideos] = flatten(similarVideoClusters)
             workingCategorized[.similarScreenshots] = flatten(similarScreenshotClusters)
 
+            // Priority routing for video buckets: a video promoted to the
+            // duplicate (similarVideos) cluster must be removed from
+            // shortRecordings / screenRecordings / videos so each asset
+            // appears in exactly one bucket.
+            let videoDuplicateIDs = Set(workingCategorized[.similarVideos, default: []].map(\.id))
+            workingCategorized[.screenRecordings] = workingCategorized[.screenRecordings, default: []].filter { !videoDuplicateIDs.contains($0.id) }
+            workingCategorized[.shortRecordings] = workingCategorized[.shortRecordings, default: []].filter { !videoDuplicateIDs.contains($0.id) }
+            workingCategorized[.videos] = workingCategorized[.videos, default: []].filter { !videoDuplicateIDs.contains($0.id) }
+
             let assets = workingCategorized.mapValues { records in
                 records.sorted {
                     if $0.sizeInBytes == $1.sizeInBytes {
@@ -1752,7 +1784,9 @@ final class AppFlow: ObservableObject {
                 .similarScreenshots: similarScreenshotClusters,
                 .screenshots: chunkClusters(workingCategorized[.screenshots, default: []], category: .screenshots, chunkSize: 12),
                 .other: chunkClusters(workingCategorized[.other, default: []], category: .other, chunkSize: 12),
-                .videos: chunkClusters(workingCategorized[.videos, default: []], category: .videos, chunkSize: 8)
+                .videos: chunkClusters(workingCategorized[.videos, default: []], category: .videos, chunkSize: 1),
+                .shortRecordings: chunkClusters(workingCategorized[.shortRecordings, default: []], category: .shortRecordings, chunkSize: 1),
+                .screenRecordings: chunkClusters(workingCategorized[.screenRecordings, default: []], category: .screenRecordings, chunkSize: 1)
             ]
 
             return (assets, clusters)
@@ -1806,7 +1840,7 @@ final class AppFlow: ObservableObject {
                 switch cluster.category {
                 case .duplicates, .similar, .similarVideos, .similarScreenshots, .screenshots:
                     shouldKeepCluster = remainingAssets.count > 1
-                case .other, .videos:
+                case .other, .videos, .shortRecordings, .screenRecordings:
                     shouldKeepCluster = !remainingAssets.isEmpty
                 }
 
@@ -2542,6 +2576,16 @@ final class AppFlow: ObservableObject {
             return Int64(Double(pixelCount) * max(asset.duration, 1) * 0.08)
         }
         return Int64(Double(pixelCount) * 0.45)
+    }
+
+    private func isScreenRecordingAsset(_ asset: PHAsset) -> Bool {
+        guard asset.mediaType == .video else { return false }
+        let resources = PHAssetResource.assetResources(for: asset)
+        guard let filename = resources.first?.originalFilename else { return false }
+        let lower = filename.lowercased()
+        return lower.hasPrefix("rpreplay")
+            || lower.hasPrefix("screen recording")
+            || lower.hasPrefix("screenrecording")
     }
 
     private func mediaDisplayTitle(for asset: PHAsset) -> String {
