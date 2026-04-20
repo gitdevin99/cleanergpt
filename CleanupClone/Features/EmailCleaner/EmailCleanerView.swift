@@ -522,7 +522,6 @@ struct EmailCleanerView: View {
     private func deleteSelectedMessages() async {
         guard appFlow.isGmailConnected, !selectedMessageIDs.isEmpty else { return }
         isDeletingMessages = true
-        defer { isDeletingMessages = false }
 
         let ids = Array(selectedMessageIDs)
         do {
@@ -531,12 +530,23 @@ struct EmailCleanerView: View {
             } else {
                 try await GmailService.shared.trashMessages(ids: ids)
             }
-            currentCategoryMessages.removeAll { selectedMessageIDs.contains($0.id) }
+
+            // Optimistic local update so the UI reflects the delete
+            // immediately, then release the spinner.
+            let deletedIDs = selectedMessageIDs
+            currentCategoryMessages.removeAll { deletedIDs.contains($0.id) }
+            currentCategoryTotalEstimate = max(0, currentCategoryTotalEstimate - deletedIDs.count)
             selectedMessageIDs.removeAll()
             isSelectAllMode = false
-            await appFlow.refreshGmailMailbox()
+            isDeletingMessages = false
+
+            // Kick off the full mailbox refresh in the background — it
+            // re-discovers senders and can take several seconds; the user
+            // doesn't need to wait for it to see their delete succeeded.
+            Task { await appFlow.refreshGmailMailbox() }
         } catch {
             categoryErrorMessage = error.localizedDescription
+            isDeletingMessages = false
         }
     }
 
