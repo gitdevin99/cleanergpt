@@ -1187,6 +1187,9 @@ struct MediaCategoryReviewView: View {
     /// Drag-to-select state for screenshot gallery.
     @StateObject private var dragSelect = DragSelectState()
 
+    /// Presents the fullscreen video preview sheet for a specific asset.
+    @State private var videoPreviewAssetID: String?
+
     init(category: DashboardCategoryKind, preselectAll: Bool = false) {
         self.category = category
         self.preselectAll = preselectAll
@@ -1287,6 +1290,17 @@ struct MediaCategoryReviewView: View {
                 sourceCategory: route.sourceCategory,
                 clusterID: route.clusterID,
                 displayTitle: route.displayTitle
+            )
+        }
+        .sheet(item: Binding(
+            get: { videoPreviewAssetID.map { VideoPreviewRoute(id: $0) } },
+            set: { videoPreviewAssetID = $0?.id }
+        )) { route in
+            VideoZoomPreviewSheet(
+                assets: cachedFilteredAssets,
+                initialAssetID: route.id,
+                selectedAssetIDs: $selectedAssetIDs,
+                accent: sourceCategory.accent
             )
         }
         .sheet(isPresented: $isShowingFilterSheet) {
@@ -1464,27 +1478,30 @@ struct MediaCategoryReviewView: View {
             screenshotActionBar
 
             ScrollView(showsIndicators: false) {
-                LazyVGrid(columns: Self.screenshotGridColumns, spacing: 12) {
+                LazyVGrid(columns: flatGalleryIsVideo ? Self.videoGridColumns : Self.screenshotGridColumns, spacing: 12) {
                     ForEach(assets) { asset in
-                        Button {
-                            toggleScreenshotSelection(asset.id)
-                        } label: {
-                            if flatGalleryIsVideo {
-                                VideoGalleryCell(
-                                    asset: asset,
-                                    isSelected: selectedAssetIDs.contains(asset.id),
-                                    accent: accentColor
-                                )
-                            } else {
+                        if flatGalleryIsVideo {
+                            VideoGalleryCell(
+                                asset: asset,
+                                isSelected: selectedAssetIDs.contains(asset.id),
+                                accent: accentColor,
+                                onTap: { toggleScreenshotSelection(asset.id) },
+                                onExpand: { videoPreviewAssetID = asset.id }
+                            )
+                            .modifier(DragSelectCellModifier(id: asset.id, coordinateSpace: "screenshotGrid"))
+                        } else {
+                            Button {
+                                toggleScreenshotSelection(asset.id)
+                            } label: {
                                 ScreenshotGalleryCell(
                                     asset: asset,
                                     isSelected: selectedAssetIDs.contains(asset.id),
                                     accent: accentColor
                                 )
                             }
+                            .buttonStyle(.plain)
+                            .modifier(DragSelectCellModifier(id: asset.id, coordinateSpace: "screenshotGrid"))
                         }
-                        .buttonStyle(.plain)
-                        .modifier(DragSelectCellModifier(id: asset.id, coordinateSpace: "screenshotGrid"))
                     }
                 }
                 .coordinateSpace(name: "screenshotGrid")
@@ -1659,6 +1676,7 @@ struct MediaCategoryReviewView: View {
     }
 
     private static let screenshotGridColumns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 3)
+    private static let videoGridColumns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 2)
 
     private func syncScreenshotSelection() {
         guard usesFlatScreenshotGallery else { return }
@@ -2860,10 +2878,16 @@ private struct ClusterDetailReviewView: View {
     }
 }
 
+private struct VideoPreviewRoute: Identifiable, Hashable {
+    let id: String
+}
+
 private struct VideoGalleryCell: View {
     let asset: MediaAssetRecord
     let isSelected: Bool
     let accent: Color
+    let onTap: () -> Void
+    let onExpand: () -> Void
 
     private var durationLabel: String {
         let total = Int(asset.duration.rounded())
@@ -2872,55 +2896,75 @@ private struct VideoGalleryCell: View {
         return String(format: "%02d:%02d", minutes, seconds)
     }
 
-    var body: some View {
-        ZStack(alignment: .topTrailing) {
-            PhotoThumbnailView(localIdentifier: asset.id, targetPointSize: 220)
-                .aspectRatio(1, contentMode: .fill)
-                .clipped()
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(alignment: .topLeading) {
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white)
-                        .padding(6)
-                        .background(Circle().fill(Color.black.opacity(0.55)))
-                        .padding(6)
-                }
-                .overlay(alignment: .topTrailing) {
-                    Text(durationLabel)
-                        .font(CleanupFont.caption(11))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                        .padding(6)
-                }
-                .overlay {
-                    Image(systemName: "play.fill")
-                        .font(.system(size: 20, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.85))
-                        .shadow(color: .black.opacity(0.6), radius: 4)
-                }
+    private var sizeLabel: String {
+        ByteCountFormatter.cleanupString(fromByteCount: asset.sizeInBytes)
+    }
 
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? accent : Color.black.opacity(0.38))
-                .frame(width: 26, height: 26)
-                .overlay {
-                    if isSelected {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(.white)
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            // Tile content (tap = toggle selection)
+            Button(action: onTap) {
+                PhotoThumbnailView(localIdentifier: asset.id, targetPointSize: 420)
+                    .aspectRatio(1, contentMode: .fill)
+                    .frame(maxWidth: .infinity)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .overlay {
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 28, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.88))
+                            .shadow(color: .black.opacity(0.6), radius: 4)
                     }
-                }
-                .padding(.top, 34)
-                .padding(.trailing, 8)
+                    .overlay(alignment: .topTrailing) {
+                        HStack(spacing: 5) {
+                            Text(durationLabel)
+                                .font(CleanupFont.caption(11))
+                            Text("·")
+                                .font(CleanupFont.caption(11))
+                                .foregroundStyle(.white.opacity(0.7))
+                            Text(sizeLabel)
+                                .font(CleanupFont.caption(11))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.black.opacity(0.62), in: Capsule(style: .continuous))
+                        .padding(8)
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        // Selection checkmark
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(isSelected ? accent : Color.black.opacity(0.5))
+                            .frame(width: 30, height: 30)
+                            .overlay {
+                                if isSelected {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundStyle(.white)
+                                }
+                            }
+                            .padding(8)
+                    }
+            }
+            .buttonStyle(.plain)
+
+            // Expand icon (tap = open preview)
+            Button(action: onExpand) {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 30, height: 30)
+                    .background(Circle().fill(Color.black.opacity(0.55)))
+                    .padding(8)
+            }
+            .buttonStyle(.plain)
         }
-        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(isSelected ? accent : Color.white.opacity(0.05), lineWidth: isSelected ? 2 : 1)
         )
-        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 }
 
@@ -2958,6 +3002,121 @@ private struct ScreenshotGalleryCell: View {
                 .strokeBorder(isSelected ? accent : Color.white.opacity(0.05), lineWidth: isSelected ? 2 : 1)
         )
         .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+private struct VideoZoomPreviewSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let assets: [MediaAssetRecord]
+    let initialAssetID: String
+    @Binding var selectedAssetIDs: Set<String>
+    let accent: Color
+
+    @State private var currentIndex: Int = 0
+
+    var body: some View {
+        ScreenContainer {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 18, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 40, height: 40)
+                            .background(Color.white.opacity(0.05), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+
+                    Spacer()
+
+                    Text("Preview")
+                        .font(CleanupFont.sectionTitle(22))
+                        .foregroundStyle(.white)
+
+                    Spacer()
+
+                    Button(currentSelected ? "Selected" : "Select") {
+                        toggleCurrentSelection()
+                    }
+                    .font(CleanupFont.body(14))
+                    .foregroundStyle(currentSelected ? .white : accent)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(currentSelected ? accent.opacity(0.92) : accent.opacity(0.12))
+                    )
+                    .buttonStyle(.plain)
+                }
+
+                TabView(selection: $currentIndex) {
+                    ForEach(Array(assets.enumerated()), id: \.element.id) { index, asset in
+                        ZoomableAssetPreview(
+                            asset: asset,
+                            isProtected: false,
+                            isSelected: selectedAssetIDs.contains(asset.id),
+                            accent: accent,
+                            isVisible: index == currentIndex
+                        )
+                        .tag(index)
+                    }
+                }
+                .tabViewStyle(.page(indexDisplayMode: .never))
+                .frame(maxHeight: .infinity)
+
+                HStack(spacing: 10) {
+                    Text("\(currentIndex + 1) / \(assets.count)")
+                        .font(CleanupFont.caption(12))
+                        .foregroundStyle(CleanupTheme.textSecondary)
+                    Spacer()
+                    if let current = currentAsset {
+                        Text("\(formattedDuration(current.duration)) · \(ByteCountFormatter.cleanupString(fromByteCount: current.sizeInBytes))")
+                            .font(CleanupFont.caption(12))
+                            .foregroundStyle(CleanupTheme.textSecondary)
+                    }
+                }
+
+                Text("Swipe to preview, tap Select to mark for deletion.")
+                    .font(CleanupFont.caption(12))
+                    .foregroundStyle(CleanupTheme.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 24)
+        }
+        .onAppear {
+            currentIndex = max(assets.firstIndex(where: { $0.id == initialAssetID }) ?? 0, 0)
+        }
+    }
+
+    private var currentAsset: MediaAssetRecord? {
+        guard assets.indices.contains(currentIndex) else { return nil }
+        return assets[currentIndex]
+    }
+
+    private var currentSelected: Bool {
+        guard let currentAsset else { return false }
+        return selectedAssetIDs.contains(currentAsset.id)
+    }
+
+    private func toggleCurrentSelection() {
+        guard let currentAsset else { return }
+        if selectedAssetIDs.contains(currentAsset.id) {
+            selectedAssetIDs.remove(currentAsset.id)
+        } else {
+            selectedAssetIDs.insert(currentAsset.id)
+        }
+    }
+
+    private func formattedDuration(_ value: TimeInterval) -> String {
+        let total = Int(value.rounded())
+        let minutes = total / 60
+        let seconds = total % 60
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 }
 
