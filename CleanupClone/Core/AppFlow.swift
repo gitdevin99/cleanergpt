@@ -644,6 +644,24 @@ final class AppFlow: ObservableObject {
     private let vaultItemsKey = "cleanup.vault.items"
     private let secretPinHashKey = "cleanup.secret.pin.hash"
     private let retiredCompressionAssetIDsKey = "cleanup.retired.compression.asset.ids"
+    /// Persisted on the last step of onboarding (either after purchase
+    /// or after the user closes the paywall). Splash reads this to
+    /// decide whether to route the user into the onboarding flow or
+    /// straight into the main app on relaunch.
+    private let onboardingCompletedKey = "cleanup.onboarding.completed"
+    /// Timestamp of the last completed library scan. Persisted so that
+    /// a relaunch with a valid on-disk snapshot can decide "library
+    /// already scanned X minutes ago, no need to touch it again" without
+    /// refetching every asset.
+    private let lastLibraryScanAtKey = "cleanup.last.library.scan.at"
+
+    /// True when `restorePersistedState()` successfully rehydrated the
+    /// scan snapshot from disk. `bootstrapIfNeeded()` branches on this —
+    /// when false, we run a full first-load scan (new install, wiped
+    /// data, or schema bump); when true, we skip straight to a light
+    /// delta check so the user doesn't pay another full scan on a
+    /// simple relaunch.
+    private(set) var didRestoreLibrarySnapshot = false
 
     private var retiredCompressionAssetIDs: Set<String> = []
     private let gmailService = GmailService.shared
@@ -868,19 +886,35 @@ final class AppFlow: ObservableObject {
     }
 
     func bootstrapIfNeeded() async {
-        guard mediaAssetsByCategory.isEmpty else {
-            refreshDeviceAndStorage()
-            refreshPermissions()
-            return
-        }
-
         refreshDeviceAndStorage()
         refreshPermissions()
 
+        // Fast path: we already have fresh results from an in-session
+        // scan or one restored from disk during init. Nothing to do
+        // beyond refreshing device/storage stats above.
+        if !mediaAssetsByCategory.allSatisfy({ $0.value.isEmpty }) {
+            if didRestoreLibrarySnapshot, photoAuthorization.isReadable {
+                // Snapshot-backed launch — reconcile the restored state
+                // against whatever's currently in the Photos library.
+                // Most launches are a no-op (count matches → skip the
+                // rescan entirely) so the dashboard stays responsive
+                // and we don't re-index 30K assets for nothing.
+                didRestoreLibrarySnapshot = false
+                await reconcileLibraryAfterRestore()
+            }
+            if contactsAuthorization.isReadable, duplicateContactGroups.isEmpty {
+                await scanContacts()
+            }
+            if eventsAuthorization.isReadable, pastEvents.isEmpty {
+                await scanEvents()
+            }
+            return
+        }
+
         if photoAuthorization.isReadable {
-            // Already gated on `mediaAssetsByCategory.isEmpty` above,
-            // so this is effectively first-load. Pass the trigger
-            // explicitly to keep the central guard enforceable.
+            // Empty in-memory state AND no snapshot on disk — genuine
+            // first load. Pass the trigger explicitly so the central
+            // guard in `scanShouldProceed` stays enforceable.
             await scanLibrary(trigger: .firstLoad)
         } else {
             applyEmptyMediaState()
@@ -893,6 +927,40 @@ final class AppFlow: ObservableObject {
         if eventsAuthorization.isReadable {
             await scanEvents()
         }
+    }
+
+    /// Lightweight check run after a snapshot-backed launch: did the
+    /// Photos library actually change while the app was closed? If the
+    /// total asset count matches what the snapshot recorded we trust
+    /// the cached state and skip the full scan entirely. If it drifted
+    /// we kick off a background rescan — the user keeps seeing the
+    /// cached dashboard numbers (which are the real numbers as of the
+    /// last scan) until the rescan finishes and `applyLibrarySnapshot`
+    /// replaces them. This is the "competitor apps don't full-scan on
+    /// every open" behavior.
+    private func reconcileLibraryAfterRestore() async {
+        guard photoAuthorization.isReadable else { return }
+
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = false
+        let currentCount = await Task.detached(priority: .userInitiated) {
+            PHAsset.fetchAssets(with: options).count
+        }.value
+
+        if currentCount == totalLibraryItems {
+            // Library hasn't grown or shrunk since the snapshot was
+            // written. Anything that shifted metadata-only (EXIF edits,
+            // favorite toggles) will be picked up by the photo-library
+            // change observer while the app is foregrounded; no point
+            // burning battery on a full rescan at launch.
+            return
+        }
+
+        // Count drift — something was added or removed. A full scan
+        // rebuilds the categorization; meanwhile the UI keeps showing
+        // the last-known numbers (not zero) so the dashboard doesn't
+        // look broken while we work.
+        await scanLibrary(trigger: .manual)
     }
 
     /// Called when a feature hits the free-tier ceiling. Free users get the
@@ -957,12 +1025,38 @@ final class AppFlow: ObservableObject {
     }
 
     /// Called by `SplashView` when the splash animation finishes and
-    /// background preload is done. Transitions into the onboarding
-    /// flow (this is a first-launch product — there's no persisted
-    /// "onboarding completed" flag yet).
+    /// background preload is done. On a fresh install we drop into
+    /// onboarding; on every subsequent launch we go straight to the
+    /// main app (and, if the user isn't premium, present the upgrade
+    /// paywall on arrival) — running onboarding a second time was the
+    /// TestFlight "why am I scanning again?" regression.
     func finishSplash() {
         guard stage == .splash else { return }
-        stage = .onboarding
+        if UserDefaults.standard.bool(forKey: onboardingCompletedKey) {
+            stage = .mainApp
+            // Non-subscribers see the upgrade sheet on cold launch.
+            // `RootView` binds this to the fullScreenCover; the check
+            // is deferred slightly so EntitlementStore has a chance to
+            // refresh from Adapty and not flash the paywall at paying
+            // users who just launched offline.
+            if !EntitlementStore.shared.isPremium {
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 400_000_000)
+                    guard let self else { return }
+                    guard !EntitlementStore.shared.isPremium else { return }
+                    self.presentUpgradePaywall = true
+                }
+            }
+        } else {
+            stage = .onboarding
+        }
+    }
+
+    /// Marks onboarding as completed in UserDefaults so the next cold
+    /// launch skips it. Called from `OnboardingFlowView` right before
+    /// transitioning to the main app.
+    func markOnboardingCompleted() {
+        UserDefaults.standard.set(true, forKey: onboardingCompletedKey)
     }
 
     func showPaywall() {
@@ -1281,6 +1375,11 @@ final class AppFlow: ObservableObject {
             return $0.sizeInBytes > $1.sizeInBytes
         }
         refreshDashboardCategories()
+
+        // Duplicates are populated in this second pass; without a
+        // re-save the on-disk snapshot would restore with an empty
+        // `.duplicates` category on next launch.
+        persistLibrarySnapshot()
     }
 
     func refineReviewClustersIfNeeded(for category: DashboardCategoryKind) async {
@@ -1512,6 +1611,8 @@ final class AppFlow: ObservableObject {
         await scanTask.value
         activeLibraryScanTask = nil
         lastLibraryScanAt = Date()
+        UserDefaults.standard.set(lastLibraryScanAt, forKey: lastLibraryScanAtKey)
+        persistLibrarySnapshot()
 
         // Drain any `PHChange` that arrived while the scan was running.
         // The scan's fetch result was captured at its start, so it still
@@ -2348,6 +2449,12 @@ final class AppFlow: ObservableObject {
         }
 
         SharedSnapshotWriter.shared.refresh(force: true)
+
+        // Persist the patched state so a relaunch after this delta
+        // starts from the new numbers, not the pre-change ones.
+        lastLibraryScanAt = Date()
+        UserDefaults.standard.set(lastLibraryScanAt, forKey: lastLibraryScanAtKey)
+        persistLibrarySnapshot()
         return true
     }
 
@@ -3114,6 +3221,37 @@ final class AppFlow: ObservableObject {
         if let retiredIDs: Set<String> = loadPersistedValue(key: retiredCompressionAssetIDsKey) {
             retiredCompressionAssetIDs = retiredIDs
         }
+
+        // Restore the last-scan timestamp so the first `.auto` trigger
+        // after relaunch respects the cooldown instead of re-scanning
+        // from scratch on every cold start.
+        if let saved = UserDefaults.standard.object(forKey: lastLibraryScanAtKey) as? Date {
+            lastLibraryScanAt = saved
+        }
+
+        // Rehydrate the dashboard from the on-disk scan snapshot. The
+        // cached results are exactly what `applyLibrarySnapshot` wrote
+        // at the end of the most recent scan, so the UI paints with the
+        // same numbers the user last saw — no "0 / 0 KB" flash while a
+        // fresh scan churns. A light delta check in
+        // `bootstrapIfNeeded()` reconciles this against the current
+        // library state in the background.
+        if let restored = ScanSnapshotStore.load() {
+            mediaAssetsByCategory = restored.mediaAssetsByCategory
+            mediaClustersByCategory = restored.mediaClustersByCategory
+            totalLibraryItems = restored.totalLibraryItems
+            photoCount = restored.photoCount
+            videoCount = restored.videoCount
+            confirmedScreenRecordingIDs = restored.confirmedScreenRecordingIDs
+            refreshDashboardCategories()
+            // Prime the lookup so any view that resolves PHAssets by
+            // local identifier doesn't have to wait for the delta scan.
+            let allIDs = restored.mediaAssetsByCategory.values.flatMap { $0.map(\.id) }
+            if !allIDs.isEmpty {
+                PhotoAssetLookup.shared.prime(localIdentifiers: Array(Set(allIDs)))
+            }
+            didRestoreLibrarySnapshot = true
+        }
     }
 
     private func applyEmptyMediaState() {
@@ -3140,6 +3278,14 @@ final class AppFlow: ObservableObject {
         scanProgress = 0
         scanStatusText = "Photo access is required"
         scannedLibraryItems = 0
+        // Photo access was revoked (or never granted). Clear the on-
+        // disk snapshot too — otherwise the next cold launch would
+        // restore dashboard numbers for photos we can no longer read,
+        // which is worse than showing an empty state.
+        ScanSnapshotStore.clear()
+        UserDefaults.standard.removeObject(forKey: lastLibraryScanAtKey)
+        lastLibraryScanAt = nil
+        didRestoreLibrarySnapshot = false
     }
 
     private func applyLibrarySnapshot(
@@ -3313,6 +3459,23 @@ final class AppFlow: ObservableObject {
             )
         }
         rebuildCompressibleAssetCaches()
+    }
+
+    /// Writes the current in-memory scan state to disk. Called after a
+    /// full scan, after the pixel-fingerprint duplicate pass, and after
+    /// an incremental library change so that the next launch can paint
+    /// the dashboard with real numbers before a single `PHAsset` fetch
+    /// runs. Fire-and-forget — the actual file write hops off to a
+    /// utility queue inside `ScanSnapshotStore.save`.
+    func persistLibrarySnapshot() {
+        ScanSnapshotStore.save(
+            totalLibraryItems: totalLibraryItems,
+            photoCount: photoCount,
+            videoCount: videoCount,
+            confirmedScreenRecordingIDs: confirmedScreenRecordingIDs,
+            assetsByCategory: mediaAssetsByCategory,
+            clustersByCategory: mediaClustersByCategory
+        )
     }
 
     private func rebuildCompressibleAssetCaches() {

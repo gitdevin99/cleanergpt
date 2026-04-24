@@ -36,5 +36,33 @@ final class PhotoAssetLookup {
     func assets(for localIdentifiers: [String]) -> [PHAsset] {
         localIdentifiers.compactMap { assetsByIdentifier[$0] }
     }
+
+    /// Rehydrates `PHAsset` references for a set of local identifiers
+    /// on a background queue. Used on cold-launch after we restore the
+    /// scan snapshot from disk: the snapshot carries asset IDs, but the
+    /// thumbnail image manager needs the actual `PHAsset` object. Runs
+    /// the `PHAsset.fetchAssets(withLocalIdentifiers:)` call off-main
+    /// so it never blocks the first frame, then hops back to the main
+    /// actor to upsert.
+    nonisolated func prime(localIdentifiers: [String]) {
+        guard !localIdentifiers.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fetch = PHAsset.fetchAssets(
+                withLocalIdentifiers: localIdentifiers,
+                options: nil
+            )
+            var collected: [PHAsset] = []
+            collected.reserveCapacity(fetch.count)
+            for index in 0..<fetch.count {
+                collected.append(fetch.object(at: index))
+            }
+            let assets = collected
+            Task { @MainActor in
+                for asset in assets {
+                    PhotoAssetLookup.shared.upsert(asset)
+                }
+            }
+        }
+    }
 }
 

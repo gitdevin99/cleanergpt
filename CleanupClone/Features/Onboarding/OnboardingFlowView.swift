@@ -389,6 +389,11 @@ struct OnboardingFlowView: View {
 
     private func finishOnboarding() {
         PostHogSDK.shared.capture("onboarding_completed")
+        // Persist the "done with onboarding" flag BEFORE transitioning
+        // so that a crash or force-quit between here and the dashboard
+        // still skips onboarding on the next launch. Without this the
+        // user would replay the whole 12-step flow.
+        appFlow.markOnboardingCompleted()
         kickOffFirstScanIfNeeded()
         appFlow.enterApp()
     }

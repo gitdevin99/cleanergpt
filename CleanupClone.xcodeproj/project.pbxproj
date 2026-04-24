@@ -62,6 +62,7 @@
 		DF5CAF9C81917E27B7E2308F /* WidgetBackground.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D8B100A01FF782C7C7C022E /* WidgetBackground.swift */; };
 		E03C836991CC9EB464090BFC /* ComboDashboardWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = E79B3E7EFC3D5C4D223C2169 /* ComboDashboardWidget.swift */; };
 		E0DEE659D781173A9A36ED84 /* CleanupCloneApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2E979F31B5D1A179A242F5C /* CleanupCloneApp.swift */; };
+		E54A997EEE24E9F3712B21BB /* ScanSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4EFCB4E201FC941F03AB765 /* ScanSnapshotStore.swift */; };
 		EA39833EB5A6EF87C78BF601 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6C482AEEAC411D5D1556FB3 /* DashboardView.swift */; };
 		F0F3567CAB7AC9EA24D5DFA4 /* SharedDataStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0801B1E26CC1A2DAAA2EA92B /* SharedDataStore.swift */; };
 		F43357CC8634140D94EDB2FF /* UpgradeGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3E13F25DE70A1BC51375D85 /* UpgradeGate.swift */; };
@@ -142,6 +143,7 @@
 		BEDB64E55D9DF75816587FA9 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		C087165D6B82FE0DA7F12379 /* BatteryPulseWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BatteryPulseWidget.swift; sourceTree = "<group>"; };
 		C24610A4F6E15DA04D41871C /* SplashView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplashView.swift; sourceTree = "<group>"; };
+		C4EFCB4E201FC941F03AB765 /* ScanSnapshotStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanSnapshotStore.swift; sourceTree = "<group>"; };
 		C5209B8D6EBED3A09606F2FD /* CleanupCloneDebug.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CleanupCloneDebug.entitlements; sourceTree = "<group>"; };
 		C6964B36A8064AF9E5810E44 /* CleanupClone.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = CleanupClone.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D720B5E589ED5EA8DAB0094E /* OnboardingFlowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingFlowView.swift; sourceTree = "<group>"; };
@@ -336,6 +338,7 @@
 				90A97DA800F91B17902D1458 /* NotificationScheduler.swift */,
 				51A8AB8136BDBB07311B1CFF /* OnboardingHaptics.swift */,
 				F5A260A6FC21B919030E5350 /* PhotoAssetLookup.swift */,
+				C4EFCB4E201FC941F03AB765 /* ScanSnapshotStore.swift */,
 				EEFD74D4615B0186CC99E9B7 /* SharedDataStore.swift */,
 				DDA82E67C305A8F04A7329CB /* SharedSnapshotWriter.swift */,
 				60F16E2860666E06D26E99C7 /* SharedToneEngine.swift */,
@@ -576,6 +579,7 @@
 				7C9F9185530FEB88472DCA90 /* PaywallView.swift in Sources */,
 				F4F79537D1F7C112798D7ED1 /* PhotoAssetLookup.swift in Sources */,
 				386FD0FCFB2F27321FD2AC71 /* RootView.swift in Sources */,
+				E54A997EEE24E9F3712B21BB /* ScanSnapshotStore.swift in Sources */,
 				6F8F69B9CFF9DB2C59A5C73A /* SecretSpaceView.swift in Sources */,
 				1642A2E58F75C237140C41F2 /* SettingsView.swift in Sources */,
 				FD53241676F9EF8010BA262A /* SharedComponents.swift in Sources */,
