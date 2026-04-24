@@ -841,12 +841,25 @@ final class AppFlow: ObservableObject {
 
             let handled = await self.applyIncrementalPhotoLibraryChange(latestChange)
             if !handled {
-                // Non-incremental change or no cache yet — iOS could
-                // not describe what changed as insert/remove/change
-                // arrays, so we have no choice but to rebuild.
-                // `.manual` because this is a real library change we
-                // must reflect (cooldown doesn't apply).
-                await self.scanLibrary(trigger: .manual)
+                // `applyIncrementalPhotoLibraryChange` returns false
+                // in two cases:
+                //   1. iOS couldn't describe the change as incremental
+                //      (`details.hasIncrementalChanges` is false).
+                //   2. We don't have a `lastLibraryFetchResult` /
+                //      `lastLibraryBuckets` cached — the common cold-
+                //      launch path after we restore a snapshot from
+                //      disk but haven't run a full scan this session.
+                //
+                // For either case, the cheap way out is the ID-diff
+                // reconcile: fetch current IDs, diff against what's
+                // in `mediaAssetsByCategory`, route only the new
+                // assets. For a single-screenshot change that's ~1s
+                // of work instead of the 85s full rescan we were
+                // firing here before. The full scan now only runs on
+                // true first-load or when the delta path itself can't
+                // cope (e.g. hundreds of new items at once).
+                print("[observer] incremental path unavailable — running ID-diff delta instead of full scan")
+                await self.reconcileLibraryAfterRestore()
             }
         }
         photoLibraryChangeDebounce = task
