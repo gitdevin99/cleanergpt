@@ -954,13 +954,20 @@ private struct SimilarStep: View {
     // through each face — giving a strong sense of motion without any card
     // ever leaving the visible area (no empty frames, ever). Each back
     // card carries a small ✕ DELETE badge; the front card gets KEEP.
+    // Six distinct faces that alternate man/woman around the stack so
+    // no slot ever shows the same person twice in a row. Prior lineup
+    // had TestimonialSarah in both slot 0 and slot 5, which (combined
+    // with the shuffle cycle) made the animation look like it was
+    // demoing duplicates of the SAME person — the exact opposite of
+    // what "Merge Similar Shots" is trying to illustrate (different
+    // people, same scene, app picks the best).
     private let photoAssets: [String] = [
         "TestimonialSarah",
+        "DuplicateSelfieElon",
         "TestimonialPriya",
-        "TestimonialMarcus",
+        "DuplicateSelfieSam",
         "DuplicateSelfieWomen",
-        "DuplicateSelfieMen",
-        "TestimonialSarah",
+        "TestimonialMarcus",
     ]
 
     // Per-card geometry in the fanned stack. Index 0 = closest to the
