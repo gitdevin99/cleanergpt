@@ -1,4 +1,5 @@
 import Foundation
+import Photos
 import SQLite3
 import Vision
 
@@ -106,6 +107,118 @@ actor MediaAnalysisStore {
             }
         } catch {
             debugPrint("MediaAnalysisStore upsertMetadataBatch failed:", error.localizedDescription)
+        }
+    }
+
+    /// Loads every asset's persisted metadata in a single query and
+    /// rebuilds a `MediaAssetRecord` for each row. This is the function
+    /// that turns the SQLite database into the source of truth for
+    /// "what have we already scanned" — a cold-launch `performLibraryScan`
+    /// pulls this once, looks up by `localIdentifier`, and skips the
+    /// expensive `makeMediaRecord` + `PHAssetResource` size lookup for
+    /// anything already in the DB. Only genuinely-new assets pay the
+    /// full scan pipeline. Everything else = ~microseconds per asset.
+    ///
+    /// Title and subtitle are derived from the stored media_type,
+    /// is_screenshot, and creation_date — same formatting that
+    /// `makeMediaRecord` / `mediaDisplayTitle` produce when building a
+    /// record from a live `PHAsset`. Matching those strings exactly
+    /// matters because the UI keys off them in a few places (sort
+    /// stability across rescans, etc.).
+    func loadAllRecords() -> [String: MediaAssetRecord] {
+        do {
+            let database = try openDatabaseIfNeeded()
+            let sql = """
+            SELECT
+                local_identifier,
+                creation_date,
+                modification_date,
+                pixel_width,
+                pixel_height,
+                media_type,
+                is_screenshot,
+                file_size_estimate
+            FROM assets_analysis
+            """
+
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw StoreError.prepare(message: lastErrorMessage(in: database))
+            }
+            defer { sqlite3_finalize(statement) }
+
+            var records: [String: MediaAssetRecord] = [:]
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let idPointer = sqlite3_column_text(statement, 0) else { continue }
+                let localIdentifier = String(cString: idPointer)
+                let creationEpoch = sqlite3_column_int64(statement, 1)
+                let createdAt: Date? = creationEpoch == 0 ? nil : Date(timeIntervalSince1970: TimeInterval(creationEpoch))
+                let modificationAt: Date?
+                if sqlite3_column_type(statement, 2) == SQLITE_NULL {
+                    modificationAt = nil
+                } else {
+                    modificationAt = Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(statement, 2)))
+                }
+                let pixelWidth = Int(sqlite3_column_int(statement, 3))
+                let pixelHeight = Int(sqlite3_column_int(statement, 4))
+                let mediaType = PHAssetMediaType(rawValue: Int(sqlite3_column_int(statement, 5))) ?? .unknown
+                let isScreenshot = sqlite3_column_int(statement, 6) != 0
+                let sizeInBytes = sqlite3_column_int64(statement, 7)
+
+                let title = Self.displayTitle(
+                    mediaType: mediaType,
+                    isScreenshot: isScreenshot,
+                    createdAt: createdAt
+                )
+                let subtitle = Self.shortDate(createdAt)
+
+                // duration isn't persisted (it was never needed by the
+                // downstream code — videos get a fresh duration via
+                // PHAsset when they get played), so we default to 0
+                // here and the scan-time pipeline will fill it in when
+                // the asset gets routed from a live PHAsset.
+                records[localIdentifier] = MediaAssetRecord(
+                    id: localIdentifier,
+                    title: title,
+                    subtitle: subtitle,
+                    sizeInBytes: sizeInBytes,
+                    duration: 0,
+                    createdAt: createdAt,
+                    modificationAt: modificationAt,
+                    mediaType: mediaType,
+                    isScreenshot: isScreenshot,
+                    pixelWidth: pixelWidth,
+                    pixelHeight: pixelHeight
+                )
+            }
+            return records
+        } catch {
+            debugPrint("MediaAnalysisStore loadAllRecords failed:", error.localizedDescription)
+            return [:]
+        }
+    }
+
+    /// Loads just the set of known `localIdentifier`s — much cheaper
+    /// than `loadAllRecords()` when the caller only needs to do set
+    /// arithmetic (e.g. "which IDs in the current PHFetchResult are new?").
+    func loadAllIdentifiers() -> Set<String> {
+        do {
+            let database = try openDatabaseIfNeeded()
+            let sql = "SELECT local_identifier FROM assets_analysis"
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw StoreError.prepare(message: lastErrorMessage(in: database))
+            }
+            defer { sqlite3_finalize(statement) }
+            var ids: Set<String> = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let pointer = sqlite3_column_text(statement, 0) else { continue }
+                ids.insert(String(cString: pointer))
+            }
+            return ids
+        } catch {
+            debugPrint("MediaAnalysisStore loadAllIdentifiers failed:", error.localizedDescription)
+            return []
         }
     }
 
@@ -404,6 +517,50 @@ actor MediaAnalysisStore {
 
     private func lastErrorMessage(in database: OpaquePointer) -> String {
         String(cString: sqlite3_errmsg(database))
+    }
+
+    /// Inline copy of `cleanupLabel` from AppFlow — "MMM d".
+    /// `AppFlow`'s extension is `fileprivate`, so we can't reach it
+    /// from this file. Duplicating the three lines here is simpler
+    /// than exporting the extension.
+    private static let labelFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d"
+        return formatter
+    }()
+
+    /// Inline copy of `cleanupShort` — medium date style, no time.
+    private static let shortFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter
+    }()
+
+    /// Mirrors `AppFlow.mediaDisplayTitle(for:)` — same format so that
+    /// a record rebuilt from the DB is string-for-string identical to
+    /// one built from a live `PHAsset`.
+    static func displayTitle(
+        mediaType: PHAssetMediaType,
+        isScreenshot: Bool,
+        createdAt: Date?
+    ) -> String {
+        let base: String
+        if mediaType == .video {
+            base = "Video"
+        } else if isScreenshot {
+            base = "Screenshot"
+        } else {
+            base = "Photo"
+        }
+        guard let createdAt else { return base }
+        return "\(base) \(labelFormatter.string(from: createdAt))"
+    }
+
+    /// Mirrors the one-liner `DateFormatter.cleanupShort.string(from:)`
+    /// the scan-time `makeMediaRecord` uses for the subtitle field.
+    static func shortDate(_ createdAt: Date?) -> String {
+        shortFormatter.string(from: createdAt ?? .now)
     }
 
     private static func databaseURL() throws -> URL {
