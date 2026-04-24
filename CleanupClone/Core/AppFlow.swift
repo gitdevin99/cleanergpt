@@ -841,14 +841,25 @@ final class AppFlow: ObservableObject {
 
             let handled = await self.applyIncrementalPhotoLibraryChange(latestChange)
             if !handled {
-                // Incremental path couldn't apply the change (no
-                // in-memory buckets, or iOS reported a non-incremental
-                // change). `scanLibrary(.manual)` now routes through
-                // the DB-backed fast path when the SQLite store has
-                // prior records — so this fires the short (~1s) scan
-                // instead of the 85s full rescan we used to trigger
-                // here.
-                await self.scanLibrary(trigger: .manual)
+                // `applyIncrementalPhotoLibraryChange` returns false
+                // in two cases:
+                //   1. iOS couldn't describe the change as incremental
+                //      (`details.hasIncrementalChanges` is false).
+                //   2. We don't have a `lastLibraryFetchResult` /
+                //      `lastLibraryBuckets` cached — the common cold-
+                //      launch path after we restore a snapshot from
+                //      disk but haven't run a full scan this session.
+                //
+                // For either case, the cheap way out is the ID-diff
+                // reconcile: fetch current IDs, diff against what's
+                // in `mediaAssetsByCategory`, route only the new
+                // assets. For a single-screenshot change that's ~1s
+                // of work instead of the 85s full rescan we were
+                // firing here before. The full scan now only runs on
+                // true first-load or when the delta path itself can't
+                // cope (e.g. hundreds of new items at once).
+                print("[observer] incremental path unavailable — running ID-diff delta instead of full scan")
+                await self.reconcileLibraryAfterRestore()
             }
         }
         photoLibraryChangeDebounce = task
@@ -1792,28 +1803,6 @@ final class AppFlow: ObservableObject {
             return
         }
 
-        // DB-backed fast path. If the SQLite analysis store already
-        // has records, the overwhelming common case (every relaunch,
-        // every pull-to-refresh, every background-foreground toggle)
-        // is that almost nothing changed. We can serve the scan in 1-2s
-        // by diffing IDs against the DB and only routing what's new,
-        // instead of re-routing all 37K assets. Fall back to the full
-        // scan only when there's genuinely no cached state to work
-        // with (true first install).
-        if await mediaAnalysisStore.loadAllIdentifiers().isEmpty == false {
-            let scanTask = Task {
-                await performDBBackedScan()
-            }
-            activeLibraryScanTask = scanTask
-            await scanTask.value
-            activeLibraryScanTask = nil
-            lastLibraryScanAt = Date()
-            UserDefaults.standard.set(lastLibraryScanAt, forKey: lastLibraryScanAtKey)
-            persistLibrarySnapshot()
-            SharedSnapshotWriter.shared.refresh(force: true)
-            return
-        }
-
         let scanTask = Task {
             await performLibraryScan()
         }
@@ -1862,257 +1851,6 @@ final class AppFlow: ObservableObject {
     /// `.auto` trigger, which does the same job centrally.
     func scanLibraryIfStale() async {
         await scanLibrary(trigger: .auto)
-    }
-
-    /// The fast scan path. Serves every trigger except first-install,
-    /// where SQLite has no prior records to lean on. Makes the SQLite
-    /// `MediaAnalysisStore` the source of truth for "what we've seen
-    /// before": reuses cached `MediaAssetRecord`s wholesale for assets
-    /// already on disk, routes ONLY genuinely-new assets through the
-    /// full `makeMediaRecord` + `routeAsset` pipeline, and deletes rows
-    /// for assets that have been removed from the library. Result: a
-    /// pull-to-refresh on an unchanged library takes ~1s (down from
-    /// ~85s); after taking one screenshot it takes ~1s to ingest it
-    /// (down from ~85s).
-    ///
-    /// Intentionally does NOT touch Vision / feature-print / pixel
-    /// fingerprint caches — those are keyed by localIdentifier and
-    /// their on-disk copies in `assets_analysis` remain valid through
-    /// the fast path. Refinement (similar clusters, pixel-fingerprint
-    /// duplicates) is only re-triggered if new assets were added.
-    private func performDBBackedScan() async {
-        let scanStart = Date()
-        print("[DB-SCAN] BEGIN")
-        libraryScanGeneration += 1
-        let scanGeneration = libraryScanGeneration
-
-        refreshDeviceAndStorage()
-        refreshPermissions()
-
-        guard photoAuthorization.isReadable else {
-            applyEmptyMediaState()
-            return
-        }
-
-        isScanningLibrary = true
-        scanProgress = 0.02
-        scanStatusText = "Checking for changes…"
-        scannedLibraryItems = 0
-
-        // 1. Fetch current PHAssets. Same options as the full scan so
-        //    the set of IDs we see is apples-to-apples with what
-        //    performLibraryScan would see on the same library state.
-        let fetchOptions = PHFetchOptions()
-        fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        let fetchResult = PHAsset.fetchAssets(with: fetchOptions)
-        let fetchCount = fetchResult.count
-        print("[DB-SCAN] PHAsset.fetchAssets count=\(fetchCount)")
-
-        // Materialise the fetch result on the main thread; Photos
-        // optimises fetch-result access for the creating thread.
-        var fetchedAssets: [PHAsset] = []
-        fetchedAssets.reserveCapacity(fetchCount)
-        fetchResult.enumerateObjects { asset, _, _ in
-            fetchedAssets.append(asset)
-        }
-        var currentIDs: Set<String> = []
-        currentIDs.reserveCapacity(fetchCount)
-        for asset in fetchedAssets {
-            currentIDs.insert(asset.localIdentifier)
-            PhotoAssetLookup.shared.upsert(asset)
-        }
-
-        // 2. Load DB records. This is the "single query" the user
-        //    asked for — the whole library's metadata in one shot.
-        let knownRecords = await mediaAnalysisStore.loadAllRecords()
-        let knownIDs = Set(knownRecords.keys)
-        print("[DB-SCAN] DB has \(knownIDs.count) records, current library has \(currentIDs.count) assets")
-
-        let addedIDs = currentIDs.subtracting(knownIDs)
-        let removedIDs = knownIDs.subtracting(currentIDs)
-
-        if scanGeneration != libraryScanGeneration { return }
-
-        // 3. Delete rows for assets that are no longer in the library.
-        if !removedIDs.isEmpty {
-            print("[DB-SCAN] removing \(removedIDs.count) assets no longer in library")
-            await mediaAnalysisStore.deleteAnalyses(for: Array(removedIDs))
-        }
-
-        // 4. Decide what to do with the added assets. For a "handful"
-        //    of new assets (e.g. 1 screenshot) we route them through
-        //    the full pipeline so they end up in the correct buckets.
-        //    For a huge delta (iCloud resync, restore-from-backup)
-        //    we fall back to the full performLibraryScan — otherwise
-        //    a cluster refinement pass over thousands of new
-        //    feature prints would stall the main thread.
-        let bulkDeltaThreshold = 500
-        if addedIDs.count > bulkDeltaThreshold {
-            print("[DB-SCAN] \(addedIDs.count) new assets exceeds threshold \(bulkDeltaThreshold) — escalating to full scan")
-            isScanningLibrary = false
-            await performLibraryScan()
-            return
-        }
-
-        // 5. Rebuild categorized buckets from the DB records for the
-        //    assets we already know about. We DO NOT have the raw
-        //    PHAssets for most of them loaded (that would be a fresh
-        //    fetch + materialise for 37K assets) — instead we rebuild
-        //    the MediaAssetRecord state from cached DB rows and route
-        //    each record into its primary category based on media_type
-        //    + is_screenshot. Similar/duplicate cluster refinement
-        //    will rerun below only if new assets were added (there's
-        //    no point refining if nothing changed).
-        var categorized: [DashboardCategoryKind: [MediaAssetRecord]] = Dictionary(
-            uniqueKeysWithValues: DashboardCategoryKind.allCases.map { ($0, []) }
-        )
-        var newPhotoCount = 0
-        var newVideoCount = 0
-
-        // The set of IDs that should actually be rebuilt from DB —
-        // intersection of "in DB" and "in current library". An asset
-        // in DB but absent from the library (already stripped above)
-        // shouldn't be rebuilt.
-        let surviveFromDB = knownIDs.intersection(currentIDs)
-        for id in surviveFromDB {
-            guard let record = knownRecords[id] else { continue }
-            if record.mediaType == .image { newPhotoCount += 1 }
-            else if record.mediaType == .video { newVideoCount += 1 }
-
-            // Primary category routing. For videos we can only tell
-            // .videos vs .shortRecordings from duration — which we
-            // didn't persist. Default to .videos (which is what the
-            // full scan would pick for anything not obviously short);
-            // the full scan on next first-install or bulk-delta will
-            // re-establish the correct bucket for short recordings.
-            // In practice the user sees their videos in the Videos
-            // card; the distinction is minor.
-            if record.mediaType == .video {
-                categorized[.videos, default: []].append(record)
-            } else {
-                categorized[.other, default: []].append(record)
-                if record.isScreenshot {
-                    categorized[.screenshots, default: []].append(record)
-                }
-            }
-        }
-
-        // 6. Route added assets through the REAL routing pipeline so
-        //    their similar / duplicate bucket keys are populated the
-        //    same way performLibraryScan would populate them. This is
-        //    what lets a new screenshot show up in Similar Screenshots
-        //    if it matches existing ones.
-        var addedRecords: [MediaAssetRecord] = []
-        addedRecords.reserveCapacity(addedIDs.count)
-        var deltaDuplicateBuckets: [String: [MediaAssetRecord]] = [:]
-        var deltaSimilarBuckets: [String: [MediaAssetRecord]] = [:]
-        var deltaSimilarVideoBuckets: [String: [MediaAssetRecord]] = [:]
-        var deltaSimilarScreenshotBuckets: [String: [MediaAssetRecord]] = [:]
-        if !addedIDs.isEmpty {
-            print("[DB-SCAN] routing \(addedIDs.count) new assets through full pipeline")
-            for asset in fetchedAssets where addedIDs.contains(asset.localIdentifier) {
-                let record = makeMediaRecord(from: asset)
-                _ = routeAsset(
-                    asset: asset,
-                    record: record,
-                    categorized: &categorized,
-                    duplicateBuckets: &deltaDuplicateBuckets,
-                    similarBuckets: &deltaSimilarBuckets,
-                    similarVideoBuckets: &deltaSimilarVideoBuckets,
-                    similarScreenshotBuckets: &deltaSimilarScreenshotBuckets
-                )
-                addedRecords.append(record)
-                if record.mediaType == .image { newPhotoCount += 1 }
-                else if record.mediaType == .video { newVideoCount += 1 }
-            }
-            // Persist the new records so next launch's DB-backed scan
-            // finds them already cached.
-            await mediaAnalysisStore.upsertMetadataBatch(addedRecords)
-        }
-
-        // 7. Commit to UI state.
-        if scanGeneration != libraryScanGeneration { return }
-        totalLibraryItems = currentIDs.count
-        photoCount = newPhotoCount
-        videoCount = newVideoCount
-
-        // applyLibrarySnapshot wants the FULL bucket dicts — but our
-        // DB scan doesn't rebuild similar/duplicate buckets for the
-        // assets we already knew about (we'd need their visual
-        // signatures to route them, which means a full rescan).
-        // Instead we just write the categorized state directly and
-        // preserve the existing mediaClustersByCategory. Cluster
-        // refinement for new items happens below via the standard
-        // verifyDuplicatesByPixel path, using the delta buckets.
-        mediaAssetsByCategory = categorized.mapValues { records in
-            records.sorted {
-                if $0.sizeInBytes == $1.sizeInBytes {
-                    return ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast)
-                }
-                return $0.sizeInBytes > $1.sizeInBytes
-            }
-        }
-        refreshDashboardCategories()
-
-        // Strip any cluster entries referencing removed assets (same
-        // logic as removeDeletedAssetsFromState but only for clusters).
-        if !removedIDs.isEmpty {
-            mediaClustersByCategory = mediaClustersByCategory.mapValues { clusters in
-                clusters.compactMap { cluster in
-                    let remaining = cluster.assets.filter { !removedIDs.contains($0.id) }
-                    guard !remaining.isEmpty else { return nil }
-                    let shouldKeep: Bool
-                    switch cluster.category {
-                    case .duplicates, .similar, .similarVideos, .similarScreenshots, .screenshots:
-                        shouldKeep = remaining.count > 1
-                    case .other, .videos, .shortRecordings, .screenRecordings:
-                        shouldKeep = true
-                    }
-                    guard shouldKeep else { return nil }
-                    return MediaCluster(
-                        id: cluster.id,
-                        category: cluster.category,
-                        assets: remaining,
-                        totalBytes: remaining.reduce(0) { $0 + $1.sizeInBytes },
-                        subtitle: cluster.subtitle
-                    )
-                }
-            }
-        }
-
-        scanProgress = 1
-        scanStatusText = currentIDs.isEmpty ? "No media found yet" : "Library up to date"
-        scannedLibraryItems = currentIDs.count
-        isScanningLibrary = false
-
-        // 8. Kick off pixel-fingerprint verification for new assets
-        //    only. The existing duplicates list is untouched for
-        //    known assets — they've already been fingerprinted in a
-        //    previous scan, so a relaunch with 0 new items is a true
-        //    no-op for duplicates too. If new assets came in we fold
-        //    them into the existing duplicate clusters by running
-        //    verifyDuplicatesByPixel against the delta candidate
-        //    buckets PLUS the current duplicate cluster members
-        //    (which are the existing verified duplicates).
-        if !addedIDs.isEmpty {
-            var candidateBucketsForVerification = deltaDuplicateBuckets
-            for cluster in mediaClustersByCategory[.duplicates, default: []] {
-                // Re-seed existing verified duplicate clusters into
-                // the candidate buckets so a new photo that matches
-                // an existing duplicate joins the right cluster.
-                candidateBucketsForVerification[cluster.id] = cluster.assets
-            }
-            pendingRefinementCategories.insert(.duplicates)
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                await self.verifyDuplicatesByPixel(candidateBuckets: candidateBucketsForVerification)
-                self.pendingRefinementCategories.remove(.duplicates)
-            }
-        }
-
-        print(String(format: "[DB-SCAN] DONE in %.3fs (added=%d removed=%d total=%d)",
-              Date().timeIntervalSince(scanStart),
-              addedIDs.count, removedIDs.count, currentIDs.count))
     }
 
     private func performLibraryScan() async {
