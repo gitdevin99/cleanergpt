@@ -929,38 +929,224 @@ final class AppFlow: ObservableObject {
         }
     }
 
-    /// Lightweight check run after a snapshot-backed launch: did the
-    /// Photos library actually change while the app was closed? If the
-    /// total asset count matches what the snapshot recorded we trust
-    /// the cached state and skip the full scan entirely. If it drifted
-    /// we kick off a background rescan — the user keeps seeing the
-    /// cached dashboard numbers (which are the real numbers as of the
-    /// last scan) until the rescan finishes and `applyLibrarySnapshot`
-    /// replaces them. This is the "competitor apps don't full-scan on
-    /// every open" behavior.
+    /// True cold-launch delta. The user's library has 30K+ assets and a
+    /// full rescan takes ~85s; if they took one screenshot while the
+    /// app was closed we emphatically do NOT want to re-route 37,750
+    /// unchanged assets just to find the one new one. This function
+    /// diffs the fresh `PHFetchResult` against the asset IDs restored
+    /// from our on-disk snapshot and hands off to one of three paths:
+    ///
+    ///   • No drift          → nothing to do. Dashboard already shows
+    ///                         the same numbers it showed last session.
+    ///   • Only removals     → strip them from the cached categorized
+    ///                         state. No Photos work needed.
+    ///   • Additions (± N)   → run a small routing pass over JUST the
+    ///                         new assets (≤ handfulThreshold) and
+    ///                         append them into the categorized state.
+    ///                         Similar / duplicate clustering for the
+    ///                         new items is deferred — they show up in
+    ///                         `.screenshots` / `.other` / `.videos`
+    ///                         immediately, and get their full cluster
+    ///                         membership on the next real scan. A
+    ///                         single new screenshot can't form a
+    ///                         similar-group on its own anyway.
+    ///   • Big additions     → fall back to a full scan (> threshold
+    ///                         means something drastic happened —
+    ///                         iCloud resync, re-enabled album, etc.
+    ///                         — and a surgical patch isn't worth
+    ///                         risking a miscategorisation).
     private func reconcileLibraryAfterRestore() async {
         guard photoAuthorization.isReadable else { return }
 
-        let options = PHFetchOptions()
-        options.includeHiddenAssets = false
-        let currentCount = await Task.detached(priority: .userInitiated) {
-            PHAsset.fetchAssets(with: options).count
+        // Match performLibraryScan's fetch options exactly so that the
+        // set of IDs we diff against is apples-to-apples with what the
+        // last full scan saw.
+        struct FetchResult {
+            let assets: [PHAsset]
+            let ids: Set<String>
+        }
+
+        let fetched = await Task.detached(priority: .userInitiated) { () -> FetchResult in
+            let options = PHFetchOptions()
+            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+            let result = PHAsset.fetchAssets(with: options)
+            var assets: [PHAsset] = []
+            var ids: Set<String> = []
+            assets.reserveCapacity(result.count)
+            ids.reserveCapacity(result.count)
+            result.enumerateObjects { asset, _, _ in
+                assets.append(asset)
+                ids.insert(asset.localIdentifier)
+            }
+            return FetchResult(assets: assets, ids: ids)
         }.value
 
-        if currentCount == totalLibraryItems {
-            // Library hasn't grown or shrunk since the snapshot was
-            // written. Anything that shifted metadata-only (EXIF edits,
-            // favorite toggles) will be picked up by the photo-library
-            // change observer while the app is foregrounded; no point
-            // burning battery on a full rescan at launch.
+        // Seed the lookup from the fresh fetch so any view that needs a
+        // PHAsset for a recently-added ID can resolve it without going
+        // back to Photos.
+        for asset in fetched.assets {
+            PhotoAssetLookup.shared.upsert(asset)
+        }
+
+        // IDs currently materialised in memory (the restored snapshot).
+        var knownIDs: Set<String> = []
+        for records in mediaAssetsByCategory.values {
+            for record in records { knownIDs.insert(record.id) }
+        }
+
+        let addedIDs = fetched.ids.subtracting(knownIDs)
+        let removedIDs = knownIDs.subtracting(fetched.ids)
+
+        if addedIDs.isEmpty, removedIDs.isEmpty {
+            print("[reconcile] library matches snapshot (\(knownIDs.count) assets) — no scan needed")
+            // Keep the stored totals honest: the fetch count is the
+            // ground truth even when the sets match (e.g. a metadata-
+            // only update can tweak totals without changing IDs).
+            totalLibraryItems = fetched.ids.count
             return
         }
 
-        // Count drift — something was added or removed. A full scan
-        // rebuilds the categorization; meanwhile the UI keeps showing
-        // the last-known numbers (not zero) so the dashboard doesn't
-        // look broken while we work.
-        await scanLibrary(trigger: .manual)
+        if !removedIDs.isEmpty {
+            print("[reconcile] removed \(removedIDs.count) assets since last launch")
+            removeDeletedAssetsFromState(removedIDs)
+        }
+
+        // Threshold above which we stop trying to surgical-patch and
+        // just let the full scan run. Chosen conservatively: if the
+        // library changed by more than this many items while the app
+        // was closed, the user likely did something bulky (imported,
+        // deleted an album, iCloud re-sync) and we'd rather pay the
+        // scan than ship partial results.
+        let handfulThreshold = 200
+
+        if addedIDs.count > handfulThreshold {
+            print("[reconcile] \(addedIDs.count) new assets exceeds threshold \(handfulThreshold) — falling back to full scan")
+            await scanLibrary(trigger: .manual)
+            return
+        }
+
+        if addedIDs.isEmpty {
+            // Removals-only — no new assets to route. Persist the
+            // updated snapshot so the next launch starts clean.
+            totalLibraryItems = fetched.ids.count
+            persistLibrarySnapshot()
+            return
+        }
+
+        print("[reconcile] routing \(addedIDs.count) new assets (library total: \(fetched.ids.count))")
+        await ingestNewAssetsIntoCache(
+            newAssets: fetched.assets.filter { addedIDs.contains($0.localIdentifier) },
+            totalCount: fetched.ids.count
+        )
+    }
+
+    /// Routes a handful of newly-discovered assets into the existing
+    /// categorised state without touching the 37K assets already there.
+    /// Deliberately skips the similar-clustering rebuild — a small
+    /// burst of new items goes straight into their primary categories
+    /// (`.screenshots`, `.other`, `.videos`, etc.) and any cross-asset
+    /// similarity or duplicate work is deferred to the next full scan.
+    /// This is the "just ingest the new one, don't burn 85 seconds"
+    /// path the user asked for.
+    @MainActor
+    private func ingestNewAssetsIntoCache(
+        newAssets: [PHAsset],
+        totalCount: Int
+    ) async {
+        guard !newAssets.isEmpty else { return }
+
+        // Build throwaway bucket dicts. We don't currently persist the
+        // similar / duplicate bucket state across launches, so for the
+        // delta path we only care about the primary categorisation
+        // (which category each new asset shows up in). The scan-time
+        // `routeAsset` already handles that correctly — we just ignore
+        // its similar/duplicate key outputs here since there's nothing
+        // to merge into.
+        var deltaCategorized: [DashboardCategoryKind: [MediaAssetRecord]] = [:]
+        var duplicateBuckets: [String: [MediaAssetRecord]] = [:]
+        var similarBuckets: [String: [MediaAssetRecord]] = [:]
+        var similarVideoBuckets: [String: [MediaAssetRecord]] = [:]
+        var similarScreenshotBuckets: [String: [MediaAssetRecord]] = [:]
+
+        var upsertBatch: [MediaAssetRecord] = []
+        upsertBatch.reserveCapacity(newAssets.count)
+
+        for asset in newAssets {
+            let record = makeMediaRecord(from: asset)
+            _ = routeAsset(
+                asset: asset,
+                record: record,
+                categorized: &deltaCategorized,
+                duplicateBuckets: &duplicateBuckets,
+                similarBuckets: &similarBuckets,
+                similarVideoBuckets: &similarVideoBuckets,
+                similarScreenshotBuckets: &similarScreenshotBuckets
+            )
+            upsertBatch.append(record)
+        }
+
+        // Merge the delta buckets into the user-visible state. Dedupe
+        // by ID so that if (e.g.) a metadata glitch puts an asset into
+        // both .other and .screenshots we don't double-count.
+        for (kind, newRecords) in deltaCategorized {
+            var existing = mediaAssetsByCategory[kind, default: []]
+            var existingIDs = Set(existing.map(\.id))
+            for record in newRecords where !existingIDs.contains(record.id) {
+                existing.append(record)
+                existingIDs.insert(record.id)
+            }
+            // Keep the same sort the full-scan snapshot uses: largest
+            // size first, then newest first, so the new item lands
+            // near the top of the grid where users expect it.
+            existing.sort {
+                if $0.sizeInBytes == $1.sizeInBytes {
+                    return ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast)
+                }
+                return $0.sizeInBytes > $1.sizeInBytes
+            }
+            mediaAssetsByCategory[kind] = existing
+        }
+
+        // Update library totals from the fresh fetch so the header
+        // counters don't drift. photoCount/videoCount recomputed from
+        // the merged state.
+        totalLibraryItems = totalCount
+        photoCount = mediaAssetsByCategory.values.reduce(0) { partial, records in
+            partial + records.filter { $0.mediaType == .image }.count
+        }
+        videoCount = mediaAssetsByCategory.values.reduce(0) { partial, records in
+            partial + records.filter { $0.mediaType == .video }.count
+        }
+        // photoCount/videoCount double-count assets that live in
+        // multiple categories (e.g. .screenshots + .other). Dedupe.
+        var photoIDs: Set<String> = []
+        var videoIDs: Set<String> = []
+        for records in mediaAssetsByCategory.values {
+            for record in records {
+                if record.mediaType == .image { photoIDs.insert(record.id) }
+                else if record.mediaType == .video { videoIDs.insert(record.id) }
+            }
+        }
+        photoCount = photoIDs.count
+        videoCount = videoIDs.count
+
+        refreshDashboardCategories()
+
+        // Persist the new records to MediaAnalysisStore so that when
+        // the next full scan runs, these assets don't pay the
+        // `PHAssetResource` size lookup again.
+        await mediaAnalysisStore.upsertMetadataBatch(upsertBatch)
+
+        // Save the fresh snapshot so if the user closes and reopens
+        // again before a full rescan runs, the new items persist.
+        lastLibraryScanAt = Date()
+        UserDefaults.standard.set(lastLibraryScanAt, forKey: lastLibraryScanAtKey)
+        persistLibrarySnapshot()
+
+        // Push to the home-screen widgets too.
+        SharedSnapshotWriter.shared.refresh(force: true)
+
+        print("[reconcile] ingested \(newAssets.count) new assets — no full scan ran")
     }
 
     /// Called when a feature hits the free-tier ceiling. Free users get the
