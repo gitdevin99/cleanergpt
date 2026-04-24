@@ -33,17 +33,6 @@ struct DashboardView: View {
     @Environment(\.requestReview) private var requestReview
 
     @State private var selectedSection: DashboardSection = .photos
-    /// When the user taps a photo/video category card without having
-    /// granted Photos access, we stash the intended destination here
-    /// and present the `photoAccessSheet` explainer. If they grant
-    /// access, we push this destination onto the nav stack; if they
-    /// cancel, we clear it. Keeping it in @State rather than handing
-    /// the card a boolean "disabled" means the tap still feels
-    /// responsive — we intercept, explain, and (on grant) complete
-    /// the original intent without a second tap.
-    @State private var pendingPhotoAccessCategory: DashboardCategoryKind?
-    @State private var isPhotoAccessSheetPresented = false
-    @State private var queuedCategoryNavigation: DashboardCategoryKind?
 
     private var photoCategories: [DashboardCategorySummary] {
         [
@@ -107,93 +96,6 @@ struct DashboardView: View {
             if selectedSection == .contacts {
                 autoRefreshContactsIfNeeded()
             }
-            // If the user went to Settings to flip Photos access on
-            // and came back, and we had a pending category tap
-            // queued, fulfill the intent now so they don't have to
-            // tap a second time.
-            if appFlow.photoAuthorization.isReadable,
-               let queued = pendingPhotoAccessCategory,
-               !isPhotoAccessSheetPresented {
-                pendingPhotoAccessCategory = nil
-                queuedCategoryNavigation = queued
-            }
-        }
-        .sheet(isPresented: $isPhotoAccessSheetPresented) {
-            PhotoAccessRequestSheet(
-                status: appFlow.photoAuthorization,
-                onAllow: {
-                    let queued = pendingPhotoAccessCategory
-                    Task { @MainActor in
-                        let granted = await appFlow.requestPhotoAccessIfNeeded()
-                        isPhotoAccessSheetPresented = false
-                        pendingPhotoAccessCategory = nil
-                        if granted, let queued {
-                            queuedCategoryNavigation = queued
-                        }
-                    }
-                },
-                onOpenSettings: {
-                    appFlow.openSystemSettings()
-                    // Keep `pendingPhotoAccessCategory` so the
-                    // didBecomeActive handler above completes the
-                    // navigation when the user returns.
-                    isPhotoAccessSheetPresented = false
-                },
-                onCancel: {
-                    pendingPhotoAccessCategory = nil
-                    isPhotoAccessSheetPresented = false
-                }
-            )
-            .presentationDetents([.medium])
-            .presentationDragIndicator(.visible)
-        }
-        // Invisible NavigationLink driven by state: fires once the
-        // user has granted access so we can complete the tap they
-        // originally made without them re-tapping the card.
-        .background(
-            NavigationLink(
-                isActive: Binding(
-                    get: { queuedCategoryNavigation != nil },
-                    set: { active in
-                        if !active { queuedCategoryNavigation = nil }
-                    }
-                ),
-                destination: {
-                    if let kind = queuedCategoryNavigation {
-                        MediaCategoryReviewView(category: kind)
-                    } else {
-                        EmptyView()
-                    }
-                },
-                label: { EmptyView() }
-            )
-            .opacity(0)
-        )
-    }
-
-    /// Wraps the category card in either a live `NavigationLink` (when
-    /// Photos access is granted) or a `Button` that opens the access
-    /// request sheet instead of dead-ending the user inside an empty
-    /// "No duplicates found" detail screen. When the sheet returns
-    /// with permission granted, we auto-navigate to the originally-
-    /// intended destination via `queuedCategoryNavigation`.
-    @ViewBuilder
-    private func gatedCategoryCard(for item: DashboardCategorySummary) -> some View {
-        if appFlow.photoAuthorization.isReadable {
-            NavigationLink {
-                MediaCategoryReviewView(category: item.kind)
-            } label: {
-                categoryCard(item, compact: true)
-            }
-            .buttonStyle(.plain)
-        } else {
-            Button {
-                pendingPhotoAccessCategory = item.kind
-                isPhotoAccessSheetPresented = true
-            } label: {
-                categoryCard(item, compact: true)
-            }
-            .buttonStyle(.plain)
         }
     }
 
@@ -326,11 +228,52 @@ struct DashboardView: View {
     private var sectionContent: some View {
         switch selectedSection {
         case .photos:
-            photoSection
+            // Mirror the Contacts tab's pattern: when permission is
+            // missing, swap the grid of empty "Zero KB" tiles for a
+            // single "Allow Photos Access" card. An empty tile grid
+            // looks like the app is broken; a clear CTA tells the
+            // user exactly what's needed to populate it.
+            if !appFlow.photoAuthorization.isReadable {
+                photoPermissionCard
+            } else {
+                photoSection
+            }
         case .videos:
-            videoSection
+            if !appFlow.photoAuthorization.isReadable {
+                photoPermissionCard
+            } else {
+                videoSection
+            }
         case .contacts:
             contactsSection
+        }
+    }
+
+    /// Same visual treatment as `ContactsMainScreen.permissionCard`:
+    /// title, one-line rationale, and a single primary CTA. Button
+    /// copy + action flip between "Allow Photos Access" (fresh
+    /// request) and "Open Settings" (previously denied — iOS won't
+    /// re-prompt so the only path is a Settings deep-link).
+    private var photoPermissionCard: some View {
+        let deniedPath = appFlow.photoAuthorization.needsSettingsRedirect
+        return GlassCard(cornerRadius: 24) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Need access to start scanning")
+                    .font(CleanupFont.sectionTitle(24))
+                    .foregroundStyle(.white)
+
+                Text("Scan your photos and videos to group duplicates, similar shots, and screenshots. Your media never leaves your device.")
+                    .font(CleanupFont.body(14))
+                    .foregroundStyle(CleanupTheme.textSecondary)
+
+                PrimaryCTAButton(title: deniedPath ? "Open Settings" : "Allow Photos Access") {
+                    if deniedPath {
+                        appFlow.openSystemSettings()
+                    } else {
+                        Task { _ = await appFlow.requestPhotoAccessIfNeeded() }
+                    }
+                }
+            }
         }
     }
 
@@ -338,7 +281,12 @@ struct DashboardView: View {
         VStack(spacing: 8) {
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
                 ForEach(photoCategories) { item in
-                    gatedCategoryCard(for: item)
+                    NavigationLink {
+                        MediaCategoryReviewView(category: item.kind)
+                    } label: {
+                        categoryCard(item, compact: true)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
 
@@ -384,7 +332,12 @@ struct DashboardView: View {
         VStack(spacing: 10) {
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
                 ForEach(videoCategories) { item in
-                    gatedCategoryCard(for: item)
+                    NavigationLink {
+                        MediaCategoryReviewView(category: item.kind)
+                    } label: {
+                        categoryCard(item, compact: true)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
 
@@ -4592,68 +4545,3 @@ enum ClusteringBuild {
     static let tag = "newest-sort-fix"
 }
 
-/// Explainer sheet shown when the user taps a category card without
-/// having granted Photos access. Presents a single CTA that either
-/// triggers the system authorization prompt (when status is still
-/// `.notDetermined`) or deep-links into iOS Settings (when a prior
-/// denial means iOS will no longer show the prompt).
-private struct PhotoAccessRequestSheet: View {
-    let status: PHAuthorizationStatus
-    let onAllow: () -> Void
-    let onOpenSettings: () -> Void
-    let onCancel: () -> Void
-
-    private var usesSettingsPath: Bool { status.needsSettingsRedirect }
-
-    var body: some View {
-        VStack(spacing: 20) {
-            Capsule()
-                .fill(Color.white.opacity(0.12))
-                .frame(width: 38, height: 4)
-                .padding(.top, 8)
-
-            ZStack {
-                Circle()
-                    .fill(CleanupTheme.electricBlue.opacity(0.14))
-                    .frame(width: 72, height: 72)
-                Image(systemName: "photo.stack.fill")
-                    .font(.system(size: 32, weight: .semibold))
-                    .foregroundStyle(CleanupTheme.electricBlue)
-            }
-
-            VStack(spacing: 8) {
-                Text("Allow Photos access")
-                    .font(CleanupFont.sectionTitle(22))
-                    .foregroundStyle(.white)
-                Text(usesSettingsPath
-                    ? "Photos access was turned off. Open Settings to turn it back on so we can find duplicates, similar shots, and free up space."
-                    : "We need Photos access to scan your library for duplicates, similar shots, and screenshots. Your photos never leave your device.")
-                    .font(CleanupFont.body(15))
-                    .foregroundStyle(CleanupTheme.textSecondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 24)
-            }
-
-            Spacer(minLength: 0)
-
-            VStack(spacing: 10) {
-                PrimaryCTAButton(
-                    title: usesSettingsPath ? "Open Settings" : "Allow Photos Access",
-                    action: usesSettingsPath ? onOpenSettings : onAllow
-                )
-
-                Button(action: onCancel) {
-                    Text("Not now")
-                        .font(CleanupFont.body(15))
-                        .foregroundStyle(CleanupTheme.textSecondary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                }
-            }
-            .padding(.horizontal, 24)
-            .padding(.bottom, 16)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(CleanupTheme.background)
-    }
-}
