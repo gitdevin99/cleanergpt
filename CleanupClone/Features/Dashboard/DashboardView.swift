@@ -1,4 +1,5 @@
 import Photos
+import StoreKit
 import SwiftUI
 
 private enum DashboardSection: String, CaseIterable, Identifiable {
@@ -28,6 +29,8 @@ struct DashboardHomeView: View {
 
 struct DashboardView: View {
     @EnvironmentObject private var appFlow: AppFlow
+    @EnvironmentObject private var entitlements: EntitlementStore
+    @Environment(\.requestReview) private var requestReview
 
     @State private var selectedSection: DashboardSection = .photos
 
@@ -56,41 +59,94 @@ struct DashboardView: View {
 
     var body: some View {
         ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 10) {
                 header
                 storageCard
                 sectionPicker
                 sectionContent
             }
             .padding(.horizontal, 14)
-            .padding(.top, 10)
-            .padding(.bottom, 108)
+            .padding(.top, 12)
+            // Just enough bottom room to clear the floating tab bar.
+            // Previously 150 — pushed Speaker Clean below the fold.
+            .padding(.bottom, 100)
         }
         .refreshable {
             await refreshForVisibleSection()
         }
+        .task {
+            askForReviewOnce()
+        }
+        // Auto-scan contacts whenever the user switches to the Contacts tab.
+        // Without this the tab would sit at "0 / 0" until the user pulled to
+        // refresh — a common complaint because contacts scanning was only
+        // triggered at onboarding completion, and a user who already has
+        // permission granted never re-hits that code path after launch.
+        .onChange(of: selectedSection) { _, newValue in
+            if newValue == .contacts {
+                autoRefreshContactsIfNeeded()
+            }
+        }
+        // If the user leaves the app to grant Contacts access in iOS
+        // Settings and comes back, re-scan so the Contacts tab populates
+        // without requiring a manual pull-to-refresh.
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didBecomeActiveNotification
+        )) { _ in
+            if selectedSection == .contacts {
+                autoRefreshContactsIfNeeded()
+            }
+        }
+    }
+
+    /// Kicks off a contacts scan when we land on the Contacts tab, but only
+    /// if there's no scan currently in progress. Safe to call on every tab
+    /// switch — `scanContacts()` is idempotent and fast on modern devices
+    /// (a couple hundred ms for a few thousand contacts), and it short-
+    /// circuits to empty state if permission isn't granted.
+    private func autoRefreshContactsIfNeeded() {
+        guard !appFlow.isScanningContacts else { return }
+        Task { await appFlow.scanContacts() }
+    }
+
+    private func askForReviewOnce() {
+        // Throttle to once per 30 days so if Apple no-ops the prompt (e.g.
+        // TestFlight, or the per-year system cap) we retry next month rather
+        // than silently never asking again.
+        let key = "dashboard.reviewRequestedAt"
+        let defaults = UserDefaults.standard
+        let now = Date().timeIntervalSince1970
+        let last = defaults.double(forKey: key)
+        if last > 0, now - last < 30 * 24 * 3600 { return }
+        defaults.set(now, forKey: key)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            requestReview()
+        }
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .center) {
-                NavigationLink {
-                    AppStatusView()
-                } label: {
-                    GlassIconLabel(symbol: "gearshape.fill")
+        VStack(alignment: .leading, spacing: 6) {
+            ZStack {
+                HStack {
+                    NavigationLink {
+                        SettingsView()
+                    } label: {
+                        GlassIconLabel(symbol: "gearshape.fill")
+                    }
+                    .modifier(GlassActionChrome())
+
+                    Spacer()
+
+                    DashboardProBadge(isPremium: entitlements.isPremium) {
+                        appFlow.presentUpgradePaywall = true
+                    }
                 }
-                .modifier(GlassActionChrome())
 
-                Spacer()
-
-                Text("Ai Cleaner")
+                Text("Cleaner GPT")
                     .font(CleanupFont.sectionTitle(20))
                     .foregroundStyle(.white.opacity(0.92))
-
-                Spacer()
-
-                PremiumPill()
             }
+            .padding(.bottom, 10)
 
             UsageBar(
                 progress: max(0.04, min(appFlow.scanProgress == 0 ? 0.04 : appFlow.scanProgress, 1)),
@@ -100,56 +156,58 @@ struct DashboardView: View {
                     endPoint: .trailing
                 )
             )
-            .frame(height: 5)
+            .frame(height: 4)
 
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                 Text(appFlow.isScanningLibrary ? "Analyzing files on your device..." : appFlow.scanStatusText)
-                    .font(CleanupFont.body(13))
+                    .font(CleanupFont.body(12))
             }
             .foregroundStyle(CleanupTheme.textSecondary)
             .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.vertical, 5)
+            .padding(.top, 6)
+            .padding(.bottom, 1)
         }
     }
 
     private var storageCard: some View {
-        GlassCard(cornerRadius: 26) {
-            VStack(alignment: .leading, spacing: 12) {
+        GlassCard(cornerRadius: 22) {
+            VStack(alignment: .leading, spacing: 10) {
                 Text("Storage")
-                    .font(CleanupFont.body(13))
+                    .font(CleanupFont.body(12))
                     .foregroundStyle(.white.opacity(0.9))
 
                 (
                     Text(ByteCountFormatter.cleanupString(fromByteCount: appFlow.storageSnapshot.usedBytes))
-                        .font(CleanupFont.hero(22))
+                        .font(CleanupFont.hero(20))
                         .foregroundStyle(.white)
                     +
                     Text(" of \(ByteCountFormatter.cleanupString(fromByteCount: appFlow.storageSnapshot.totalBytes))")
-                        .font(CleanupFont.body(16))
+                        .font(CleanupFont.body(14))
                         .foregroundStyle(CleanupTheme.textSecondary)
                 )
 
                 UsageBar(progress: max(0.04, min(appFlow.storageSnapshot.progress, 1)), palette: CleanupTheme.warmBar)
-                    .frame(height: 7)
+                    .frame(height: 6)
+                    .padding(.bottom, 4)
 
                 NavigationLink {
                     SmartCleaningView()
                 } label: {
                     HStack(spacing: 8) {
                         Text("AI Smart Clean")
-                            .font(CleanupFont.body(16))
+                            .font(CleanupFont.body(15))
                         Image(systemName: "sparkles")
                             .font(.system(size: 12, weight: .bold))
                     }
                     .foregroundStyle(.white)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
+                    .padding(.vertical, 10)
                 }
                 .background(CleanupTheme.cta)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .shadow(color: CleanupTheme.electricBlue.opacity(0.22), radius: 12, y: 7)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .shadow(color: CleanupTheme.electricBlue.opacity(0.22), radius: 10, y: 5)
                 .buttonStyle(.plain)
             }
         }
@@ -179,8 +237,8 @@ struct DashboardView: View {
     }
 
     private var photoSection: some View {
-        VStack(spacing: 10) {
-            LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
+        VStack(spacing: 8) {
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
                 ForEach(photoCategories) { item in
                     NavigationLink {
                         MediaCategoryReviewView(category: item.kind)
@@ -212,18 +270,34 @@ struct DashboardView: View {
                 )
             }
             .buttonStyle(.plain)
+
+            NavigationLink {
+                EventsCleanupView()
+            } label: {
+                wideActionCard(
+                    eyebrow: "Old birthdays, meetings, reminders?",
+                    title: "Clean Calendar Events",
+                    accent: CleanupTheme.electricBlue
+                )
+            }
+            .buttonStyle(.plain)
         }
     }
 
     private var videoSection: some View {
+        // Mirror the Photos layout: two-column grid of compact cards. Full-
+        // width rows made the Videos tab feel empty and forced scrolling for
+        // what are usually just 3 categories (duplicates, short, screen).
         VStack(spacing: 10) {
-            ForEach(videoCategories) { item in
-                NavigationLink {
-                    MediaCategoryReviewView(category: item.kind)
-                } label: {
-                    categoryCard(item, compact: false)
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+                ForEach(videoCategories) { item in
+                    NavigationLink {
+                        MediaCategoryReviewView(category: item.kind)
+                    } label: {
+                        categoryCard(item, compact: true)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
             }
 
             NavigationLink {
@@ -240,35 +314,119 @@ struct DashboardView: View {
     }
 
     private var contactsSection: some View {
-        VStack(spacing: 10) {
-            GlassCard(cornerRadius: 26) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Duplicate contacts")
-                        .font(CleanupFont.sectionTitle(18))
-                        .foregroundStyle(.white)
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+            contactGridCard(
+                title: "Duplicate",
+                count: appFlow.contactAnalysisSummary.duplicateGroupCount,
+                subtitle: duplicateSubtitle,
+                icon: "person.2.fill",
+                accent: CleanupTheme.electricBlue,
+                target: .duplicates
+            )
 
-                    Text("\(appFlow.duplicateContactGroups.count) groups ready to review")
-                        .font(CleanupFont.body(14))
-                        .foregroundStyle(CleanupTheme.textSecondary)
+            contactGridCard(
+                title: "Incomplete",
+                count: appFlow.incompleteContacts.count,
+                subtitle: "Missing info",
+                icon: "person.fill.questionmark",
+                accent: Color(hex: "#FFB445"),
+                target: .incomplete
+            )
 
-                    GlassProminentCTA {
-                        appFlow.selectTab(.contacts)
-                    } label: {
-                        Text("Open Contacts")
-                            .font(CleanupFont.body(15))
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 13)
-                    }
-                }
-            }
+            contactGridCard(
+                title: "All Contacts",
+                count: appFlow.contactAnalysisSummary.totalCount,
+                subtitle: "Browse & manage",
+                icon: "person.crop.circle",
+                accent: CleanupTheme.accentGreen,
+                target: .allContacts
+            )
+
+            contactGridCard(
+                title: "Backups",
+                count: appFlow.contactBackupService.backups.count,
+                subtitle: contactsBackupSubtitle,
+                icon: "externaldrive.fill.badge.person.crop",
+                accent: CleanupTheme.accentCyan,
+                target: .backups
+            )
         }
     }
 
+    private var duplicateSubtitle: String {
+        let groups = appFlow.contactAnalysisSummary.duplicateGroupCount
+        return groups == 0 ? "No duplicates" : "\(groups) groups ready"
+    }
+
+    private var contactsBackupSubtitle: String {
+        if let last = appFlow.contactBackupService.lastBackupDate {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "MMM d, yyyy"
+            let prefix = appFlow.contactBackupService.isUsingICloud ? "Last iCloud" : "Last backup"
+            return "\(prefix): \(formatter.string(from: last))"
+        }
+        return "No backups yet"
+    }
+
+    private func contactGridCard(
+        title: String,
+        count: Int,
+        subtitle: String,
+        icon: String,
+        accent: Color,
+        target: ContactsView.ContactScreen
+    ) -> some View {
+        Button {
+            appFlow.pendingContactScreen = target
+            appFlow.selectTab(.contacts)
+        } label: {
+            GlassCard(cornerRadius: 24) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .top) {
+                        HStack(spacing: 4) {
+                            Text(title)
+                                .font(CleanupFont.caption(12))
+                                .foregroundStyle(CleanupTheme.textSecondary)
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(CleanupTheme.textSecondary)
+                        }
+                        Spacer()
+                    }
+
+                    Text("\(count)")
+                        .font(CleanupFont.sectionTitle(28))
+                        .foregroundStyle(.white)
+
+                    Text(subtitle)
+                        .font(CleanupFont.caption(11))
+                        .foregroundStyle(CleanupTheme.textTertiary)
+                        .lineLimit(1)
+
+                    HStack {
+                        Spacer()
+                        ZStack {
+                            Circle()
+                                .fill(accent.opacity(0.2))
+                                .frame(width: 34, height: 34)
+                            Image(systemName: icon)
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(accent)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
     private func categoryCard(_ item: DashboardCategorySummary, compact: Bool) -> some View {
-        let isAnalyzing = appFlow.isScanningLibrary && selectedSection != .contacts
+        let reviewKind = reviewCategory(for: item.kind)
+        let isRefining = appFlow.isRefiningClusters(for: reviewKind)
+        let isAnalyzing = (appFlow.isScanningLibrary || isRefining) && selectedSection != .contacts
         let hasResults = item.count > 0 || item.totalBytes > 0
-        let previewClusters = appFlow.mediaClusters(for: reviewCategory(for: item.kind))
+        let previewClusters = appFlow.mediaClusters(for: reviewKind)
 
         return GlassCard(cornerRadius: 24) {
             VStack(alignment: .leading, spacing: 8) {
@@ -338,11 +496,17 @@ struct DashboardView: View {
     }
 
     private func cardValue(for item: DashboardCategorySummary, isAnalyzing: Bool, hasResults: Bool) -> String {
-        if hasResults {
+        // When analysis is in progress with no real results yet, we must
+        // NEVER render "Zero KB" — it looks like a bug (and the detail
+        // screen lands on an empty state that makes it feel broken).
+        // Prefer "Analyzing…" whenever the pipeline hasn't produced a
+        // meaningful byte count yet. The only case we keep the formatted
+        // value is when we have non-zero bytes to show.
+        if hasResults, item.totalBytes > 0 {
             return ByteCountFormatter.cleanupString(fromByteCount: item.totalBytes)
         }
         if isAnalyzing {
-            return "Analyzing..."
+            return "Analyzing…"
         }
         return ByteCountFormatter.cleanupString(fromByteCount: item.totalBytes)
     }
@@ -358,6 +522,14 @@ struct DashboardView: View {
     }
 
     private func cardStatus(for item: DashboardCategorySummary, hasResults: Bool) -> String {
+        let reviewKind = reviewCategory(for: item.kind)
+        if appFlow.isRefiningClusters(for: reviewKind) {
+            // During refinement the raw bucket count is still visible
+            // on the card (too loose — includes false positives). This
+            // tells the user the number will shrink once the strict
+            // face-identity / pixel-level checks finish.
+            return "Refining clusters for accuracy…"
+        }
         if hasResults {
             return "\(item.count) found so far"
         }
@@ -418,9 +590,12 @@ struct DashboardView: View {
     }
 
     private func refreshForVisibleSection() async {
+        // Pull-to-refresh: user explicitly asked for fresh data, so
+        // `.manual` — this one should always run, even during
+        // refinement, because the user is in control.
         switch selectedSection {
         case .photos, .videos:
-            await appFlow.scanLibrary()
+            await appFlow.scanLibrary(trigger: .manual)
         case .contacts:
             await appFlow.scanContacts()
         }
@@ -847,7 +1022,21 @@ struct SmartCleaningView: View {
 
         if appFlow.photoAuthorization.isReadable {
             analysisStatus = "Analyzing photos and videos..."
-            await appFlow.scanLibrary()
+            // Re-use the dashboard's most recent scan instead of kicking
+            // off a second full pipeline run. The dashboard already
+            // scans on launch and on pull-to-refresh; starting Smart
+            // Clean would otherwise fire a duplicate 30k-asset Vision
+            // pass that thrashes CPU for no extra information. We only
+            // force a rescan if there's nothing on file yet or the
+            // results are older than the auto-rescan cooldown.
+            if appFlow.shouldRescanForSmartClean() {
+                await appFlow.scanLibrary(trigger: .auto)
+            } else if appFlow.isScanningLibrary,
+                      let active = appFlow.activeLibraryScanAwaitable {
+                // A scan is already running (launched by the dashboard).
+                // Just await it rather than starting a new one.
+                await active.value
+            }
         } else {
             analysisStatus = "Photo access is needed for media analysis."
         }
@@ -1264,19 +1453,30 @@ struct MediaCategoryReviewView: View {
             leadingSymbol: "chevron.left",
             trailingSymbol: "arrow.clockwise",
             leadingAction: { dismiss() },
-            trailingAction: { Task { await appFlow.scanLibrary() } }
+            // Top-right refresh button on a cluster screen —
+            // user-initiated, so `.manual` bypasses the auto cooldown.
+            trailingAction: { Task { await appFlow.scanLibrary(trigger: .manual) } }
         ) {
             VStack(alignment: .leading, spacing: 18) {
                 if !appFlow.photoAuthorization.isReadable {
                     permissionCard
                 } else if filteredContentIsEmpty {
-                    emptyState
+                    // During a (re-)scan or the post-scan duplicate
+                    // verification, clusters are intentionally empty.
+                    // Showing "No duplicates" in that window looks like
+                    // the app lost data — surface a refining card
+                    // instead so the user knows work is still happening.
+                    if isRefiningExactClusters || appFlow.isScanningLibrary {
+                        refiningState
+                    } else {
+                        emptyState
+                    }
                 } else {
                     if usesFlatScreenshotGallery {
                         screenshotGallery
                     } else {
                         actionBar
-                        clusterList
+                        clusterListWithDeleteBar
                     }
                 }
             }
@@ -1325,6 +1525,31 @@ struct MediaCategoryReviewView: View {
             rebuildFilteredCaches()
             applyInitialSelectionIfNeeded()
             syncScreenshotSelection()
+            // Kick off cluster refinement when the user actually
+            // lands on a review screen. Refinement is expensive
+            // (Vision feature prints + face embeddings per asset),
+            // so we defer it until the category is being reviewed
+            // — and it's idempotent, so re-entry is cheap once the
+            // signature hasn't changed.
+            await appFlow.refineReviewClustersIfNeeded(for: sourceCategory)
+            rebuildFilteredCaches()
+        }
+        // Re-check permission state whenever the user comes back into the
+        // app. Covers the "denied → Open Settings → toggled on → returned"
+        // flow so the permission card disappears without a manual refresh.
+        //
+        // IMPORTANT: we no longer auto-rescan the library here. iOS fires
+        // `didBecomeActive` during every in-app sheet/fullScreenCover
+        // dismissal, PHAsset preview close, even when the user just
+        // navigates into a subcluster. That was retriggering the full
+        // Vision pipeline every time and draining battery for no reason.
+        // The `PHPhotoLibraryChangeObserver` in AppFlow picks up real
+        // library changes (new screenshots, deletions) with an
+        // incremental diff, so this foreground-rescan is redundant.
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didBecomeActiveNotification
+        )) { _ in
+            appFlow.refreshPermissions()
         }
         .onChange(of: clusters.count) { _, newCount in
             guard newCount != lastClusterCount else { return }
@@ -1399,14 +1624,27 @@ struct MediaCategoryReviewView: View {
     }
 
     private var permissionCard: some View {
-        GlassCard(cornerRadius: 24) {
+        // iOS will only show the system permission dialog when status is
+        // `.notDetermined`. Once a user has denied access, calling
+        // `requestAuthorization` returns `.denied` synchronously and the
+        // CTA silently does nothing — which is exactly the "button feels
+        // broken" bug users hit. When the status is denied/restricted we
+        // switch the copy + action to deep-link into iOS Settings, which
+        // is the only real path back to "granted."
+        let deniedPath = appFlow.photoAuthorization.needsSettingsRedirect
+
+        return GlassCard(cornerRadius: 24) {
             VStack(alignment: .leading, spacing: 14) {
-                Text("Photo access is needed to review and delete media.")
+                Text(deniedPath
+                    ? "Photo access was turned off. Open Settings to turn it back on so we can review and delete media."
+                    : "Photo access is needed to review and delete media.")
                     .font(CleanupFont.body(16))
                     .foregroundStyle(.white)
-                PrimaryCTAButton(title: "Allow Photos Access") {
-                    Task {
-                        _ = await appFlow.requestPhotoAccessIfNeeded()
+                PrimaryCTAButton(title: deniedPath ? "Open Settings" : "Allow Photos Access") {
+                    if deniedPath {
+                        appFlow.openSystemSettings()
+                    } else {
+                        Task { _ = await appFlow.requestPhotoAccessIfNeeded() }
                     }
                 }
             }
@@ -1426,8 +1664,34 @@ struct MediaCategoryReviewView: View {
         }
     }
 
+    /// Shown when a scan or cluster-refinement pass is still running.
+    /// Using `emptyState` here would lie to the user — it says "nothing
+    /// to clean" when really we just haven't finished checking yet.
+    private var refiningState: some View {
+        GlassCard(cornerRadius: 24) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(category.accent)
+                    Text("Refining \(category.title.lowercased())…")
+                        .font(CleanupFont.sectionTitle(20))
+                        .foregroundStyle(.white)
+                }
+                Text("We're double-checking each candidate to avoid false positives. Results will appear here as soon as the pass finishes.")
+                    .font(CleanupFont.body(15))
+                    .foregroundStyle(CleanupTheme.textSecondary)
+            }
+        }
+    }
+
+    /// Top toolbar on cluster overview screens (Similar, Duplicates, etc.).
+    /// Keeps just "Select all / Clear" and the filter pill. The bulk-
+    /// delete CTA lives in `clusterDeleteBar`, which floats in from
+    /// the bottom only once the user has actually selected something —
+    /// that way the top stays visually quiet until it's needed.
     private var actionBar: some View {
-        HStack(alignment: .center) {
+        HStack(alignment: .center, spacing: 12) {
             Button(selectedClusterIDs.count == selectableClusters.count ? "Clear" : "Select all duplicates") {
                 if selectedClusterIDs.count == selectableClusters.count {
                     selectedClusterIDs.removeAll()
@@ -1444,29 +1708,6 @@ struct MediaCategoryReviewView: View {
             .buttonStyle(.plain)
 
             Spacer()
-
-            if isDeleting {
-                ProgressView()
-                    .tint(.white)
-            } else {
-                PrimaryCTAButton(title: selectedDeletionIDs.isEmpty ? "Delete Selected" : "Delete \(selectedDeletionIDs.count) Duplicates") {
-                    Task {
-                        isDeleting = true
-                        let deleteCount = selectedDeletionIDs.count
-                        let success = await appFlow.deleteAssets(with: selectedDeletionIDs)
-                        isDeleting = false
-                        if success {
-                            statusMessage = "Deleted \(deleteCount) item(s)."
-                            selectedClusterIDs.removeAll()
-                        } else {
-                            statusMessage = "Delete failed. Please try again."
-                        }
-                    }
-                }
-                .disabled(selectedDeletionIDs.isEmpty)
-                .opacity(selectedDeletionIDs.isEmpty ? 0.5 : 1)
-                .frame(maxWidth: 220)
-            }
         }
     }
 
@@ -1478,6 +1719,16 @@ struct MediaCategoryReviewView: View {
             screenshotActionBar
 
             ScrollView(showsIndicators: false) {
+                // Probe as first child inside ScrollView — superview chain
+                // from here reaches the underlying UIScrollView, so the
+                // installer can attach its pan recognizer to the right view.
+                HorizontalDragSelectInstaller(
+                    dragSelect: dragSelect,
+                    assets: assets,
+                    selectedAssetIDs: $selectedAssetIDs
+                )
+                .frame(width: 0, height: 0)
+
                 LazyVGrid(columns: flatGalleryIsVideo ? Self.videoGridColumns : Self.screenshotGridColumns, spacing: 12) {
                     ForEach(assets) { asset in
                         if flatGalleryIsVideo {
@@ -1496,7 +1747,8 @@ struct MediaCategoryReviewView: View {
                                 ScreenshotGalleryCell(
                                     asset: asset,
                                     isSelected: selectedAssetIDs.contains(asset.id),
-                                    accent: accentColor
+                                    accent: accentColor,
+                                    onZoom: { videoPreviewAssetID = asset.id }
                                 )
                             }
                             .buttonStyle(.plain)
@@ -1508,19 +1760,28 @@ struct MediaCategoryReviewView: View {
                 .onPreferenceChange(DragSelectCellFrameKey.self) { frames in
                     dragSelect.cellFrames = frames
                 }
-                .modifier(DragSelectGestureModifier(
-                    enabled: true,
-                    coordinateSpace: "screenshotGrid",
-                    dragSelect: dragSelect,
-                    assets: assets,
-                    selectedAssetIDs: $selectedAssetIDs
-                ))
                 .padding(.bottom, 120)
             }
-            .scrollDisabled(dragSelect.isDragging)
 
             screenshotDeleteBar
         }
+    }
+
+    /// Wraps the cluster list in a ZStack with a floating "Delete N
+    /// Selected" bar anchored at the bottom, mirroring the inside-a-
+    /// cluster review experience. Users can now bulk-delete entire
+    /// clusters from the top-level list without drilling into each
+    /// one — useful when they trust the auto-picked keep for every
+    /// group on the screen.
+    private var clusterListWithDeleteBar: some View {
+        ZStack(alignment: .bottom) {
+            clusterList
+            if !selectedClusterIDs.isEmpty {
+                clusterDeleteBar
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: selectedClusterIDs.isEmpty)
     }
 
     private var clusterList: some View {
@@ -1559,7 +1820,46 @@ struct MediaCategoryReviewView: View {
                     }
                 }
             }
-            .padding(.bottom, 24)
+            // Extra bottom padding so the last cluster card can scroll
+            // above the floating delete bar when it's visible. 120pt
+            // matches the screenshot gallery's bottom inset.
+            .padding(.bottom, selectedClusterIDs.isEmpty ? 24 : 120)
+        }
+    }
+
+    /// Floating bulk-delete CTA for the cluster-list screen. Each
+    /// selected cluster contributes every asset after the first (the
+    /// keep) to the deletion set — same rule the detail view uses when
+    /// you tap "Select duplicates" inside a cluster.
+    private var clusterDeleteBar: some View {
+        let count = selectedDeletionIDs.count
+        let title = count == 0 ? "Delete Selected" : "Delete \(count) Selected"
+        return PrimaryCTAButton(title: title) {
+            Task {
+                guard !selectedDeletionIDs.isEmpty else { return }
+                isDeleting = true
+                let deleteCount = selectedDeletionIDs.count
+                let success = await appFlow.deleteAssets(
+                    with: selectedDeletionIDs,
+                    kind: .duplicateCluster
+                )
+                isDeleting = false
+
+                if success {
+                    statusMessage = "Deleted \(deleteCount) item(s)."
+                    selectedClusterIDs.removeAll()
+                } else {
+                    statusMessage = "Delete failed. Please try again."
+                }
+            }
+        }
+        .disabled(count == 0 || isDeleting)
+        .opacity(count == 0 ? 0.5 : 1)
+        .overlay {
+            if isDeleting {
+                ProgressView()
+                    .tint(.white)
+            }
         }
     }
 
@@ -1592,7 +1892,8 @@ struct MediaCategoryReviewView: View {
                 guard !selectedDeletionIDs.isEmpty else { return }
                 isDeleting = true
                 let deleteCount = selectedDeletionIDs.count
-                let success = await appFlow.deleteAssets(with: selectedDeletionIDs)
+                let kind: FreeAction = flatGalleryIsVideo ? .videoDelete : .photoDelete
+                let success = await appFlow.deleteAssets(with: selectedDeletionIDs, kind: kind)
                 isDeleting = false
 
                 if success {
@@ -1800,18 +2101,19 @@ private struct MediaReviewFilterSheet: View {
                         }
                     }
 
+                    // Clear + Apply always both visible so every sort
+                    // mode (Newest, Oldest, Largest, Smallest) has the
+                    // same footer — no mode-specific layout shift.
                     HStack(spacing: 12) {
-                        if canClear {
-                            Button("Clear") {
-                                onClear()
-                            }
-                            .font(CleanupFont.body(15))
-                            .foregroundStyle(CleanupTheme.textSecondary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 15)
-                            .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                            .buttonStyle(.plain)
+                        Button("Clear") {
+                            onClear()
                         }
+                        .font(CleanupFont.body(15))
+                        .foregroundStyle(CleanupTheme.textSecondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 15)
+                        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .buttonStyle(.plain)
 
                         Button("Apply") {
                             onApply()
@@ -1882,30 +2184,33 @@ private struct MediaReviewFilter: Equatable {
     }
 
     func apply(to assets: [MediaAssetRecord]) -> [MediaAssetRecord] {
-        // Short-circuit: no date filter and default sort → return as-is (already sorted by AppFlow)
-        if startDate == nil && endDate == nil && sortMode == .newest {
-            return assets
-        }
-        return assets.filter(matchesDateRange).sorted(by: assetComparator)
+        // No short-circuit: AppFlow sorts by size (largest first), so
+        // "Newest" has to actually re-sort by date. The previous early-
+        // return made Newest render the same order as Largest.
+        let filtered = (startDate == nil && endDate == nil)
+            ? assets
+            : assets.filter(matchesDateRange)
+        return filtered.sorted(by: assetComparator)
     }
 
     func apply(to clusters: [MediaCluster]) -> [MediaCluster] {
-        // Short-circuit: no date filter and default sort → return as-is (already sorted by AppFlow)
-        if startDate == nil && endDate == nil && sortMode == .newest {
-            return clusters
+        let scoped: [MediaCluster]
+        if startDate == nil && endDate == nil {
+            scoped = clusters
+        } else {
+            scoped = clusters.compactMap { cluster in
+                let filteredAssets = cluster.assets.filter(matchesDateRange)
+                guard !filteredAssets.isEmpty else { return nil }
+                return MediaCluster(
+                    id: cluster.id,
+                    category: cluster.category,
+                    assets: filteredAssets,
+                    totalBytes: filteredAssets.reduce(0) { $0 + $1.sizeInBytes },
+                    subtitle: cluster.subtitle
+                )
+            }
         }
-        return clusters.compactMap { cluster in
-            let filteredAssets = cluster.assets.filter(matchesDateRange)
-            guard !filteredAssets.isEmpty else { return nil }
-            return MediaCluster(
-                id: cluster.id,
-                category: cluster.category,
-                assets: filteredAssets,
-                totalBytes: filteredAssets.reduce(0) { $0 + $1.sizeInBytes },
-                subtitle: cluster.subtitle
-            )
-        }
-        .sorted(by: clusterComparator)
+        return scoped.sorted(by: clusterComparator)
     }
 
     private func matchesDateRange(_ asset: MediaAssetRecord) -> Bool {
@@ -1939,15 +2244,25 @@ private struct MediaReviewFilter: Equatable {
     }
 
     private func clusterComparator(lhs: MediaCluster, rhs: MediaCluster) -> Bool {
+        // `assets.first` is the LARGEST asset (AppFlow's pre-sort),
+        // not necessarily the newest. For date-based ordering we
+        // take the cluster's min/max createdAt so "Newest" actually
+        // surfaces the clusters with the most recent photos.
+        func maxDate(_ cluster: MediaCluster) -> Date? {
+            cluster.assets.compactMap(\.createdAt).max()
+        }
+        func minDate(_ cluster: MediaCluster) -> Date? {
+            cluster.assets.compactMap(\.createdAt).min()
+        }
         switch sortMode {
         case .newest:
-            return compareDates(lhs.assets.first?.createdAt, rhs.assets.first?.createdAt, descending: true)
+            return compareDates(maxDate(lhs), maxDate(rhs), descending: true)
         case .oldest:
-            return compareDates(lhs.assets.first?.createdAt, rhs.assets.first?.createdAt, descending: false)
+            return compareDates(minDate(lhs), minDate(rhs), descending: false)
         case .largest:
-            return compareSizes(lhs.totalBytes, rhs.totalBytes, lhsDate: lhs.assets.first?.createdAt, rhsDate: rhs.assets.first?.createdAt, descending: true)
+            return compareSizes(lhs.totalBytes, rhs.totalBytes, lhsDate: maxDate(lhs), rhsDate: maxDate(rhs), descending: true)
         case .smallest:
-            return compareSizes(lhs.totalBytes, rhs.totalBytes, lhsDate: lhs.assets.first?.createdAt, rhsDate: rhs.assets.first?.createdAt, descending: false)
+            return compareSizes(lhs.totalBytes, rhs.totalBytes, lhsDate: maxDate(lhs), rhsDate: maxDate(rhs), descending: false)
         }
     }
 
@@ -2651,6 +2966,7 @@ private struct ClusterDetailReviewView: View {
     @State private var statusMessage: String?
     @State private var previewAssetID: String?
     @State private var previewSelection = 0
+    @StateObject private var dragSelect = DragSelectState()
 
     private var cluster: MediaCluster? {
         appFlow.mediaClusters(for: sourceCategory).first { $0.id == clusterID }
@@ -2678,14 +2994,13 @@ private struct ClusterDetailReviewView: View {
             trailingSymbol: nil,
             leadingAction: { dismiss() }
         ) {
-            VStack(alignment: .leading, spacing: 18) {
-                summaryCard
-
+            VStack(alignment: .leading, spacing: 16) {
                 if assets.isEmpty {
                     emptyState
                 } else {
                     actionBar
                     selectionGrid
+                    clusterDeleteBar
                 }
             }
         }
@@ -2739,44 +3054,60 @@ private struct ClusterDetailReviewView: View {
         }
     }
 
+    /// Top toolbar: "Select all" chip + "N selected" hint. Destructive
+    /// action lives in `clusterDeleteBar` at the bottom, matching the
+    /// layout used by the flat screenshot/video gallery.
     private var actionBar: some View {
         HStack(spacing: 12) {
-            Button(selectedAssetIDs.count == duplicateCandidates.count ? "Clear" : "Select all") {
+            Button {
                 if selectedAssetIDs.count == duplicateCandidates.count {
                     selectedAssetIDs.removeAll()
                 } else {
                     selectedAssetIDs = Set(duplicateCandidates.map(\.id))
                 }
+            } label: {
+                Text(selectedAssetIDs.count == duplicateCandidates.count && !duplicateCandidates.isEmpty ? "Clear" : "Select all")
+                    .font(CleanupFont.body(14))
+                    .foregroundStyle(sourceCategory.accent)
             }
-            .font(CleanupFont.body(14))
-            .foregroundStyle(sourceCategory.accent)
             .buttonStyle(.plain)
 
             Spacer()
 
+            if !deletableAssetIDs.isEmpty {
+                Text("\(deletableAssetIDs.count) selected")
+                    .font(CleanupFont.caption(12))
+                    .foregroundStyle(CleanupTheme.textSecondary)
+            }
+        }
+    }
+
+    /// Full-width Delete bar at the bottom of the screen — same placement
+    /// and style as `screenshotDeleteBar` on the flat gallery.
+    private var clusterDeleteBar: some View {
+        PrimaryCTAButton(title: deletableAssetIDs.isEmpty ? "Delete Selected" : "Delete \(deletableAssetIDs.count) Selected") {
+            Task {
+                guard !deletableAssetIDs.isEmpty else { return }
+                guard appFlow.gateSingleAction(.duplicateCluster) else { return }
+                isDeleting = true
+                let deleteCount = deletableAssetIDs.count
+                let success = await appFlow.deleteAssets(with: deletableAssetIDs, kind: .photoDelete)
+                isDeleting = false
+
+                if success {
+                    statusMessage = "Deleted \(deleteCount) item(s)."
+                    dismiss()
+                } else {
+                    statusMessage = "Delete failed. Please try again."
+                }
+            }
+        }
+        .disabled(deletableAssetIDs.isEmpty || isDeleting)
+        .opacity(deletableAssetIDs.isEmpty ? 0.5 : 1)
+        .overlay {
             if isDeleting {
                 ProgressView()
                     .tint(.white)
-            } else {
-                PrimaryCTAButton(title: deletableAssetIDs.isEmpty ? "Delete Selected" : "Delete \(deletableAssetIDs.count) Selected") {
-                    Task {
-                        guard !deletableAssetIDs.isEmpty else { return }
-                        isDeleting = true
-                        let deleteCount = deletableAssetIDs.count
-                        let success = await appFlow.deleteAssets(with: deletableAssetIDs)
-                        isDeleting = false
-
-                        if success {
-                            statusMessage = "Deleted \(deleteCount) item(s)."
-                            dismiss()
-                        } else {
-                            statusMessage = "Delete failed. Please try again."
-                        }
-                    }
-                }
-                .disabled(deletableAssetIDs.isEmpty)
-                .opacity(deletableAssetIDs.isEmpty ? 0.5 : 1)
-                .frame(maxWidth: 220)
             }
         }
     }
@@ -2795,20 +3126,38 @@ private struct ClusterDetailReviewView: View {
     }
 
     private var selectionGrid: some View {
-        ScrollView(showsIndicators: false) {
+        let draggableAssets = Array(assets.dropFirst())
+        return ScrollView(showsIndicators: false) {
+            // Probe inside the ScrollView so its superview chain reaches
+            // the underlying UIScrollView. This is where the installer
+            // attaches its horizontal-pan recognizer.
+            HorizontalDragSelectInstaller(
+                dragSelect: dragSelect,
+                assets: draggableAssets,
+                selectedAssetIDs: $selectedAssetIDs
+            )
+            .frame(width: 0, height: 0)
+
             LazyVGrid(columns: gridColumns, spacing: 10) {
                 ForEach(Array(assets.enumerated()), id: \.element.id) { index, asset in
+                    let isProtected = index == 0
                     ClusterDetailAssetCell(
                         asset: asset,
-                        isProtected: index == 0,
+                        isProtected: isProtected,
                         isSelected: selectedAssetIDs.contains(asset.id),
                         accent: sourceCategory.accent,
                         onToggle: {
-                            toggleSelection(for: asset, isProtected: index == 0)
+                            toggleSelection(for: asset, isProtected: isProtected)
                         },
                         onZoom: {
                             previewAssetID = asset.id
                         }
+                    )
+                    .modifier(
+                        DragSelectCellModifier(
+                            id: isProtected ? "__keep_\(asset.id)" : asset.id,
+                            coordinateSpace: "clusterDetailGrid"
+                        )
                     )
                     .onAppear {
                         PhotoThumbnailView.startCaching(localIdentifiers: detailPreheatIdentifiers(around: index))
@@ -2817,6 +3166,10 @@ private struct ClusterDetailReviewView: View {
                         PhotoThumbnailView.stopCaching(localIdentifiers: detailPreheatIdentifiers(around: index))
                     }
                 }
+            }
+            .coordinateSpace(name: "clusterDetailGrid")
+            .onPreferenceChange(DragSelectCellFrameKey.self) { frames in
+                dragSelect.cellFrames = frames
             }
             .padding(.bottom, 24)
         }
@@ -2868,8 +3221,151 @@ private struct ClusterDetailReviewView: View {
     }
 }
 
-private struct VideoPreviewRoute: Identifiable, Hashable {
+struct VideoPreviewRoute: Identifiable, Hashable {
     let id: String
+}
+
+// MARK: - Horizontal Drag-Select (UIKit)
+
+/// SwiftUI shim that installs a horizontal-only `UIPanGestureRecognizer`
+/// directly on the enclosing `UIScrollView`. The recognizer's delegate
+/// returns true from `gestureRecognizerShouldBegin` ONLY when the initial
+/// velocity is horizontal-dominant — vertical pans fall through to the
+/// scroll view's own pan recognizer so scroll keeps working.
+///
+/// Why this works where a SwiftUI `.simultaneousGesture` didn't: SwiftUI's
+/// DragGesture claims the touch at its `minimumDistance` threshold and
+/// starves the scroll view, regardless of direction. A UIKit recognizer
+/// with `gestureRecognizerShouldBegin` can refuse the touch up-front, so
+/// the scroll view's recognizer wins cleanly on vertical motion.
+private struct HorizontalDragSelectInstaller: UIViewRepresentable {
+    @ObservedObject var dragSelect: DragSelectState
+    let assets: [MediaAssetRecord]
+    @Binding var selectedAssetIDs: Set<String>
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            dragSelect: dragSelect,
+            getAssets: { assets },
+            getSelectedIDs: { selectedAssetIDs },
+            setSelectedIDs: { selectedAssetIDs = $0 }
+        )
+    }
+
+    func makeUIView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.backgroundColor = .clear
+        view.isUserInteractionEnabled = false // do not intercept any touches ourselves
+        view.onMoved = { [weak view] in
+            guard let view else { return }
+            context.coordinator.attachIfNeeded(from: view)
+        }
+        return view
+    }
+
+    func updateUIView(_ uiView: ProbeView, context: Context) {
+        context.coordinator.getAssets = { assets }
+        context.coordinator.getSelectedIDs = { selectedAssetIDs }
+        context.coordinator.setSelectedIDs = { selectedAssetIDs = $0 }
+        // Retry attachment in case the scroll view wasn't in the hierarchy
+        // when makeUIView first ran (common with lazy loading).
+        DispatchQueue.main.async {
+            context.coordinator.attachIfNeeded(from: uiView)
+        }
+    }
+
+    /// Zero-size probe view used to find the scroll view in the hierarchy.
+    final class ProbeView: UIView {
+        var onMoved: (() -> Void)?
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            onMoved?()
+        }
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        unowned let dragSelect: DragSelectState
+        var getAssets: () -> [MediaAssetRecord]
+        var getSelectedIDs: () -> Set<String>
+        var setSelectedIDs: (Set<String>) -> Void
+
+        private weak var attachedScrollView: UIScrollView?
+        private weak var panRecognizer: UIPanGestureRecognizer?
+
+        init(dragSelect: DragSelectState,
+             getAssets: @escaping () -> [MediaAssetRecord],
+             getSelectedIDs: @escaping () -> Set<String>,
+             setSelectedIDs: @escaping (Set<String>) -> Void) {
+            self.dragSelect = dragSelect
+            self.getAssets = getAssets
+            self.getSelectedIDs = getSelectedIDs
+            self.setSelectedIDs = setSelectedIDs
+        }
+
+        /// Walk up the superview chain to find the nearest UIScrollView and
+        /// attach our pan recognizer to it.
+        func attachIfNeeded(from probe: UIView) {
+            guard panRecognizer == nil else { return }
+            guard let scrollView = enclosingScrollView(of: probe) else { return }
+
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+            pan.delegate = self
+            pan.maximumNumberOfTouches = 1
+            pan.cancelsTouchesInView = false
+            scrollView.addGestureRecognizer(pan)
+
+            attachedScrollView = scrollView
+            panRecognizer = pan
+        }
+
+        private func enclosingScrollView(of view: UIView) -> UIScrollView? {
+            var parent: UIView? = view.superview
+            while let p = parent {
+                if let sv = p as? UIScrollView { return sv }
+                parent = p.superview
+            }
+            return nil
+        }
+
+        @MainActor
+        @objc func handlePan(_ recognizer: UIPanGestureRecognizer) {
+            guard let scrollView = attachedScrollView else { return }
+            let location = recognizer.location(in: scrollView)
+
+            switch recognizer.state {
+            case .began:
+                dragSelect.orderedIDs = getAssets().map(\.id)
+                dragSelect.dragBegan(at: location, currentSelection: getSelectedIDs())
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            case .changed:
+                if let newSelection = dragSelect.dragMoved(to: location) {
+                    setSelectedIDs(newSelection)
+                }
+            case .ended, .cancelled, .failed:
+                if let finalSelection = dragSelect.dragEnded() {
+                    setSelectedIDs(finalSelection)
+                }
+            default:
+                break
+            }
+        }
+
+        // THE critical piece: only claim the touch when motion is
+        // horizontal-dominant. Otherwise return false → scroll view's own
+        // pan recognizer (which has no such gate) wins and scrolls.
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard let pan = gestureRecognizer as? UIPanGestureRecognizer,
+                  let view = pan.view else { return false }
+            let v = pan.velocity(in: view)
+            return abs(v.x) > abs(v.y)
+        }
+
+        // Coexist with the scroll view's built-in pan recognizer; never cancel.
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            true
+        }
+    }
 }
 
 private struct DragSelectGestureModifier: ViewModifier {
@@ -3000,45 +3496,75 @@ private struct VideoGalleryCell: View {
     }
 }
 
+/// Unified flat-gallery cell. Matches `ClusterDetailAssetCell` exactly —
+/// square 1:1 aspect, magnifier zoom icon top-left, checkbox top-right.
+/// Same UI language everywhere (inside cluster vs. flat gallery).
 private struct ScreenshotGalleryCell: View {
     let asset: MediaAssetRecord
     let isSelected: Bool
     let accent: Color
+    /// Optional zoom-preview callback. When provided, the magnifier icon
+    /// appears in the top-left and triggers this on tap.
+    var onZoom: (() -> Void)?
 
-    private var aspectRatio: CGFloat {
-        guard asset.pixelWidth > 0, asset.pixelHeight > 0 else { return 9 / 16 }
-        return CGFloat(asset.pixelWidth) / CGFloat(asset.pixelHeight)
-    }
+    private var isVideo: Bool { asset.mediaType == .video }
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
+        ZStack {
             PhotoThumbnailView(localIdentifier: asset.id, targetPointSize: 220)
-                .aspectRatio(aspectRatio, contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
 
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? accent : Color.black.opacity(0.38))
-                .frame(width: 28, height: 28)
-                .overlay {
-                    if isSelected {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(.white)
+            if isVideo {
+                Image(systemName: "play.circle.fill")
+                    .font(.system(size: 32))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+            }
+
+            VStack {
+                HStack {
+                    if let onZoom {
+                        Button(action: onZoom) {
+                            Image(systemName: "plus.magnifyingglass")
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 28, height: 28)
+                                .background(Color.black.opacity(0.4), in: Circle())
+                        }
+                        .buttonStyle(.plain)
                     }
+
+                    Spacer()
+
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(isSelected ? accent : Color.black.opacity(0.46))
+                        .frame(width: 24, height: 24)
+                        .overlay {
+                            if isSelected {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundStyle(.white)
+                            }
+                        }
                 }
-                .padding(8)
+                Spacer()
+            }
+            .padding(8)
         }
-        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .aspectRatio(1, contentMode: .fit)
+        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(isSelected ? accent : Color.white.opacity(0.05), lineWidth: isSelected ? 2 : 1)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(isSelected ? accent : Color.white.opacity(0.06), lineWidth: isSelected ? 2 : 1)
         )
-        .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 }
 
-private struct VideoZoomPreviewSheet: View {
+struct VideoZoomPreviewSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var appFlow: AppFlow
 
     let assets: [MediaAssetRecord]
     let initialAssetID: String
@@ -3046,11 +3572,18 @@ private struct VideoZoomPreviewSheet: View {
     let accent: Color
 
     @State private var currentIndex: Int = 0
+    @State private var isShowingTrashBin: Bool = false
+    @State private var isDeleting: Bool = false
+    @State private var statusMessage: String?
+    @AppStorage(SwipeCleanPreferences.toggleKey) private var swipeCleanEnabled: Bool = false
 
     var body: some View {
         ScreenContainer {
             VStack(alignment: .leading, spacing: 14) {
-                HStack {
+                // Header: back chevron on the left, inline swipe/view toggle
+                // on the right. The toggle lives here — not in Settings — so
+                // users discover it where they'd use it.
+                HStack(spacing: 10) {
                     Button {
                         dismiss()
                     } label: {
@@ -3064,61 +3597,121 @@ private struct VideoZoomPreviewSheet: View {
 
                     Spacer()
 
-                    Text("Preview")
-                        .font(CleanupFont.sectionTitle(22))
+                    Text(swipeCleanEnabled ? "Swipe to Clean" : "Preview")
+                        .font(CleanupFont.sectionTitle(20))
                         .foregroundStyle(.white)
+                        .lineLimit(1)
 
                     Spacer()
 
-                    Button(currentSelected ? "Selected" : "Select") {
-                        toggleCurrentSelection()
-                    }
-                    .font(CleanupFont.body(14))
-                    .foregroundStyle(currentSelected ? .white : accent)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .background(
-                        Capsule(style: .continuous)
-                            .fill(currentSelected ? accent.opacity(0.92) : accent.opacity(0.12))
+                    SwipeModeTogglePill(isOn: $swipeCleanEnabled, accent: accent)
+                }
+
+                // Reviewed / total progress. Matches the competitor's
+                // top-right counter — users can see how close they are to
+                // done without scanning the filmstrip.
+                reviewedProgressRow
+
+                if swipeCleanEnabled {
+                    SwipeCleanDeck(
+                        assets: assets,
+                        selectedAssetIDs: $selectedAssetIDs,
+                        currentIndex: $currentIndex,
+                        accent: accent,
+                        onFinished: { dismiss() },
+                        onTrashTap: { isShowingTrashBin = true }
                     )
-                    .buttonStyle(.plain)
-                }
-
-                TabView(selection: $currentIndex) {
-                    ForEach(Array(assets.enumerated()), id: \.element.id) { index, asset in
-                        ZoomableAssetPreview(
-                            asset: asset,
-                            isProtected: false,
-                            isSelected: selectedAssetIDs.contains(asset.id),
-                            accent: accent,
-                            isVisible: index == currentIndex
-                        )
-                        .tag(index)
+                    .padding(.top, 4)
+                } else {
+                    // Windowed paging: only instantiate the current card and
+                    // its immediate neighbors. Libraries of 9k+ duplicates
+                    // made the previous all-eager TabView thrash memory and
+                    // stall scrolling badly.
+                    TabView(selection: $currentIndex) {
+                        ForEach(Array(assets.enumerated()), id: \.element.id) { index, asset in
+                            Group {
+                                if abs(index - currentIndex) <= 2 {
+                                    ZoomableAssetPreview(
+                                        asset: asset,
+                                        isProtected: false,
+                                        isSelected: selectedAssetIDs.contains(asset.id),
+                                        accent: accent,
+                                        isVisible: index == currentIndex,
+                                        onTapToToggle: { toggleSelection(for: asset) }
+                                    )
+                                } else {
+                                    Color.clear
+                                }
+                            }
+                            .tag(index)
+                        }
                     }
-                }
-                .tabViewStyle(.page(indexDisplayMode: .never))
-                .frame(maxHeight: .infinity)
+                    .tabViewStyle(.page(indexDisplayMode: .never))
+                    .frame(maxHeight: .infinity)
 
-                HStack(spacing: 10) {
-                    Text("\(currentIndex + 1) / \(assets.count)")
-                        .font(CleanupFont.caption(12))
-                        .foregroundStyle(CleanupTheme.textSecondary)
-                    Spacer()
-                    if let current = currentAsset {
-                        Text("\(formattedDuration(current.duration)) · \(ByteCountFormatter.cleanupString(fromByteCount: current.sizeInBytes))")
-                            .font(CleanupFont.caption(12))
-                            .foregroundStyle(CleanupTheme.textSecondary)
+                    HStack(spacing: 10) {
+                        if let current = currentAsset {
+                            Text("\(formattedDuration(current.duration)) · \(ByteCountFormatter.cleanupString(fromByteCount: current.sizeInBytes))")
+                                .font(CleanupFont.caption(12))
+                                .foregroundStyle(CleanupTheme.textSecondary)
+                        }
+                        Spacer()
+                        // Tap-to-toggle lives on the image itself now. This
+                        // is just a quick-access chip that mirrors the card
+                        // state so power users on small phones still have
+                        // a reliable target.
+                        Button(action: toggleCurrentSelection) {
+                            HStack(spacing: 6) {
+                                Image(systemName: currentSelected ? "trash.fill" : "trash")
+                                    .font(.system(size: 12, weight: .bold))
+                                Text(currentSelected ? "Marked" : "Mark")
+                                    .font(CleanupFont.caption(12))
+                            }
+                            .foregroundStyle(currentSelected ? .white : accent)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(currentSelected ? Color(hex: "#E63946") : accent.opacity(0.14))
+                            )
+                        }
+                        .buttonStyle(.plain)
                     }
-                }
 
-                Text("Swipe to preview, tap Select to mark for deletion.")
-                    .font(CleanupFont.caption(12))
-                    .foregroundStyle(CleanupTheme.textSecondary)
-                    .frame(maxWidth: .infinity, alignment: .center)
+                    // Bottom filmstrip — same component the swipe deck uses.
+                    // Users can scroll, tap to jump, and see red dots on
+                    // everything they've already marked for deletion.
+                    FilmstripView(
+                        assets: assets,
+                        currentIndex: $currentIndex,
+                        selectedAssetIDs: selectedAssetIDs,
+                        accent: accent
+                    )
+                    .frame(height: 64)
+
+                    // Bottom action row for non-swipe mode: trash-bin
+                    // entry + Delete N CTA. In swipe mode the deck's
+                    // own trash pill + Keep/Delete buttons cover this.
+                    nonSwipeActionRow
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, 24)
+        }
+        // Keep the preview locked on screen — users were accidentally
+        // pulling down and losing the sheet mid-review. Only the back
+        // chevron exits.
+        .interactiveDismissDisabled(true)
+        .sheet(isPresented: $isShowingTrashBin) {
+            TrashBinSheet(
+                assets: assets,
+                selectedAssetIDs: $selectedAssetIDs,
+                accent: accent,
+                onEmptyTrash: { ids in
+                    await appFlow.deleteAssets(with: ids, kind: .photoDelete)
+                }
+            )
         }
         .onAppear {
             currentIndex = max(assets.firstIndex(where: { $0.id == initialAssetID }) ?? 0, 0)
@@ -3139,28 +3732,155 @@ private struct VideoZoomPreviewSheet: View {
         return selectedAssetIDs.contains(currentAsset.id)
     }
 
+    /// Count of items in this sheet's assets that the user has marked
+    /// for deletion. Filters against the current `assets` list so stale
+    /// IDs don't count.
+    private var pendingDeleteCount: Int {
+        assets.reduce(0) { $0 + (selectedAssetIDs.contains($1.id) ? 1 : 0) }
+    }
+
+    /// Bottom action row for non-swipe (paged) mode. Shows a trash-bin
+    /// entry point on the left and a full-width "Delete N" CTA on the
+    /// right when anything is marked. Without this, users could
+    /// multi-select across the filmstrip but had no way to actually
+    /// act on the selection from inside the preview.
+    @ViewBuilder
+    private var nonSwipeActionRow: some View {
+        if pendingDeleteCount > 0 {
+            HStack(spacing: 10) {
+                Button {
+                    isShowingTrashBin = true
+                } label: {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "trash.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 48, height: 48)
+                            .background(Color.white.opacity(0.08), in: Circle())
+                        Text("\(pendingDeleteCount)")
+                            .font(CleanupFont.badge(10))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color(hex: "#E63946"), in: Capsule(style: .continuous))
+                            .offset(x: 4, y: -2)
+                    }
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    Task { await deleteSelected() }
+                } label: {
+                    HStack(spacing: 8) {
+                        if isDeleting {
+                            ProgressView().tint(.white)
+                        } else {
+                            Image(systemName: "trash.fill")
+                                .font(.system(size: 14, weight: .bold))
+                        }
+                        Text(isDeleting ? "Deleting…" : "Delete \(pendingDeleteCount)")
+                            .font(CleanupFont.body(15))
+                    }
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(Color(hex: "#E63946"), in: Capsule(style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .disabled(isDeleting)
+            }
+            .padding(.top, 4)
+        }
+    }
+
+    /// Runs the bulk delete. `appFlow.deleteAssets` invokes
+    /// `PHPhotoLibrary.performChanges`, which surfaces Apple's native
+    /// "Delete N photos?" system prompt — that's the real, loud
+    /// permission dialog the user asked for.
+    private func deleteSelected() async {
+        let ids = assets.map(\.id).filter { selectedAssetIDs.contains($0) }
+        guard !ids.isEmpty, !isDeleting else { return }
+        isDeleting = true
+        statusMessage = nil
+        let success = await appFlow.deleteAssets(with: ids, kind: .photoDelete)
+        isDeleting = false
+        if success {
+            for id in ids { selectedAssetIDs.remove(id) }
+            dismiss()
+        } else {
+            statusMessage = "Delete cancelled."
+        }
+    }
+
+    /// Header subrow: "N / Total reviewed" plus a thin progress bar.
+    /// Matches the competitor's top-right counter — gives users a
+    /// concrete sense of how far they are through the set.
+    private var reviewedProgressRow: some View {
+        let total = max(assets.count, 1)
+        let reviewed = min(currentIndex + 1, total)
+        let progress = Double(reviewed) / Double(total)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("\(reviewed) / \(total) reviewed")
+                    .font(CleanupFont.caption(12))
+                    .foregroundStyle(CleanupTheme.textSecondary)
+                Spacer()
+                if selectedAssetIDs.count > 0 {
+                    Text("\(selectedAssetIDs.count) to delete")
+                        .font(CleanupFont.caption(12))
+                        .foregroundStyle(Color(hex: "#E63946"))
+                }
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.08))
+                    Capsule()
+                        .fill(accent)
+                        .frame(width: max(4, geo.size.width * progress))
+                }
+            }
+            .frame(height: 3)
+        }
+    }
+
     private func toggleCurrentSelection() {
         guard let currentAsset else { return }
-        if selectedAssetIDs.contains(currentAsset.id) {
-            selectedAssetIDs.remove(currentAsset.id)
+        toggleSelection(for: currentAsset)
+    }
+
+    private func toggleSelection(for asset: MediaAssetRecord) {
+        if selectedAssetIDs.contains(asset.id) {
+            selectedAssetIDs.remove(asset.id)
         } else {
-            selectedAssetIDs.insert(currentAsset.id)
+            selectedAssetIDs.insert(asset.id)
         }
     }
 
     private func prefetchNeighbors() {
-        var ids: [String] = []
+        var videoIds: [String] = []
+        var photoIds: [String] = []
         for offset in [-2, -1, 1, 2] {
             let idx = currentIndex + offset
-            guard assets.indices.contains(idx), assets[idx].mediaType == .video else { continue }
-            ids.append(assets[idx].id)
+            guard assets.indices.contains(idx) else { continue }
+            let asset = assets[idx]
+            if asset.mediaType == .video {
+                videoIds.append(asset.id)
+            } else {
+                photoIds.append(asset.id)
+            }
         }
-        VideoPrefetcher.shared.prefetch(identifiers: ids)
+        VideoPrefetcher.shared.prefetch(identifiers: videoIds)
 
         // Keep a small window around the current index; drop the rest.
-        var keep = Set(ids)
+        var keep = Set(videoIds)
         if let current = currentAsset { keep.insert(current.id) }
         VideoPrefetcher.shared.keep(keep)
+
+        // Warm photo thumbnails for adjacent cards so a swipe doesn't
+        // flash a placeholder before the real image fades in.
+        if !photoIds.isEmpty {
+            PhotoThumbnailView.startCaching(localIdentifiers: photoIds, targetPointSize: 900)
+        }
     }
 
     private func formattedDuration(_ value: TimeInterval) -> String {
@@ -3173,6 +3893,7 @@ private struct VideoZoomPreviewSheet: View {
 
 private struct ClusterZoomPreviewSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var appFlow: AppFlow
 
     let assets: [MediaAssetRecord]
     let initialAssetID: String
@@ -3180,11 +3901,29 @@ private struct ClusterZoomPreviewSheet: View {
     let accent: Color
 
     @State private var currentIndex = 0
+    /// Deck uses a separate index because `swipeableAssets` is
+    /// `assets.dropFirst()` — their ranges differ by 1. A computed
+    /// binding keeps the two in sync without duplicating state.
+    @State private var swipeIndex: Int = 0
+    @State private var isShowingTrashBin: Bool = false
+    @State private var isDeleting: Bool = false
+    @State private var statusMessage: String?
+    @AppStorage(SwipeCleanPreferences.toggleKey) private var swipeCleanEnabled: Bool = false
+
+    /// In a cluster the first asset is the "keeper" — never shown in the deck.
+    /// Everything else is a candidate for delete vs keep.
+    private var swipeableAssets: [MediaAssetRecord] {
+        assets.count > 1 ? Array(assets.dropFirst()) : []
+    }
+
+    private var swipeModeActive: Bool {
+        swipeCleanEnabled && swipeableAssets.count >= 1
+    }
 
     var body: some View {
         ScreenContainer {
             VStack(alignment: .leading, spacing: 16) {
-                HStack {
+                HStack(spacing: 10) {
                     Button {
                         dismiss()
                     } label: {
@@ -3198,59 +3937,92 @@ private struct ClusterZoomPreviewSheet: View {
 
                     Spacer()
 
-                    Text("Preview")
-                        .font(CleanupFont.sectionTitle(22))
+                    Text(swipeModeActive ? "Swipe to Clean" : "Preview")
+                        .font(CleanupFont.sectionTitle(20))
                         .foregroundStyle(.white)
+                        .lineLimit(1)
 
                     Spacer()
 
-                    Button(currentAssetProtected ? "Protected" : (currentAssetSelected ? "Selected" : "Select")) {
-                        toggleCurrentSelection()
-                    }
-                    .font(CleanupFont.body(14))
-                    .foregroundStyle(currentAssetProtected ? CleanupTheme.textSecondary : (currentAssetSelected ? .white : accent))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .background(
-                        Capsule(style: .continuous)
-                            .fill(currentAssetProtected ? Color.white.opacity(0.06) : (currentAssetSelected ? accent.opacity(0.92) : accent.opacity(0.12)))
+                    // Inline swipe-mode toggle. Disabled when there's only a
+                    // single candidate (just the keeper and one dupe) — the
+                    // deck has nothing to animate and the paged view is fine.
+                    SwipeModeTogglePill(isOn: $swipeCleanEnabled, accent: accent)
+                        .disabled(swipeableAssets.isEmpty)
+                        .opacity(swipeableAssets.isEmpty ? 0.4 : 1)
+                }
+
+                clusterReviewedRow
+
+                if swipeModeActive {
+                    SwipeCleanDeck(
+                        assets: swipeableAssets,
+                        selectedAssetIDs: $selectedAssetIDs,
+                        currentIndex: $swipeIndex,
+                        accent: accent,
+                        onFinished: { dismiss() },
+                        onTrashTap: { isShowingTrashBin = true }
                     )
-                    .buttonStyle(.plain)
-                    .disabled(currentAssetProtected)
-                }
-
-                TabView(selection: $currentIndex) {
-                    ForEach(Array(assets.enumerated()), id: \.element.id) { index, asset in
-                        ZoomableAssetPreview(
-                            asset: asset,
-                            isProtected: index == 0,
-                            isSelected: selectedAssetIDs.contains(asset.id),
-                            accent: accent,
-                            isVisible: index == currentIndex
-                        )
-                        .tag(index)
+                } else {
+                    TabView(selection: $currentIndex) {
+                        ForEach(Array(assets.enumerated()), id: \.element.id) { index, asset in
+                            Group {
+                                if abs(index - currentIndex) <= 2 {
+                                    ZoomableAssetPreview(
+                                        asset: asset,
+                                        isProtected: index == 0,
+                                        isSelected: selectedAssetIDs.contains(asset.id),
+                                        accent: accent,
+                                        isVisible: index == currentIndex,
+                                        onTapToToggle: index == 0 ? nil : { toggleSelection(for: asset) }
+                                    )
+                                } else {
+                                    Color.clear
+                                }
+                            }
+                            .tag(index)
+                        }
                     }
-                }
-                .tabViewStyle(.page(indexDisplayMode: .never))
-                .frame(maxHeight: .infinity)
+                    .tabViewStyle(.page(indexDisplayMode: .never))
+                    .frame(maxHeight: .infinity)
 
-                HStack(spacing: 8) {
-                    ForEach(Array(assets.enumerated()), id: \.element.id) { index, _ in
-                        Capsule(style: .continuous)
-                            .fill(index == currentIndex ? accent : Color.white.opacity(0.14))
-                            .frame(width: index == currentIndex ? 20 : 8, height: 8)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .center)
+                    // Bottom filmstrip gives a full preview of every asset
+                    // in the cluster. The first item is the keeper — it
+                    // renders with an accent border and can't be marked.
+                    FilmstripView(
+                        assets: assets,
+                        currentIndex: $currentIndex,
+                        selectedAssetIDs: selectedAssetIDs,
+                        accent: accent
+                    )
+                    .frame(height: 64)
 
-                Text(helpText)
-                    .font(CleanupFont.caption(12))
-                    .foregroundStyle(CleanupTheme.textSecondary)
-                    .frame(maxWidth: .infinity, alignment: .center)
+                    Text(helpText)
+                        .font(CleanupFont.caption(12))
+                        .foregroundStyle(CleanupTheme.textSecondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+
+                    // Delete CTA for cluster preview's non-swipe mode.
+                    // The first asset is the protected keeper so it can't
+                    // be in `selectedAssetIDs` — `pendingDeleteCount` is
+                    // derived from the full `assets` list anyway.
+                    clusterActionRow
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, 24)
+        }
+        .interactiveDismissDisabled(true)
+        .sheet(isPresented: $isShowingTrashBin) {
+            TrashBinSheet(
+                assets: assets,
+                selectedAssetIDs: $selectedAssetIDs,
+                accent: accent,
+                onEmptyTrash: { ids in
+                    await appFlow.deleteAssets(with: ids, kind: .duplicateCluster)
+                }
+            )
         }
         .onAppear {
             currentIndex = max(assets.firstIndex(where: { $0.id == initialAssetID }) ?? 0, 0)
@@ -3258,6 +4030,76 @@ private struct ClusterZoomPreviewSheet: View {
         }
         .onChange(of: currentIndex) { _, _ in
             prefetchNeighbors()
+        }
+    }
+
+    /// Count of items in this cluster marked for deletion.
+    private var pendingDeleteCount: Int {
+        assets.reduce(0) { $0 + (selectedAssetIDs.contains($1.id) ? 1 : 0) }
+    }
+
+    /// Non-swipe bottom action row (trash-bin entry + Delete N CTA).
+    /// Mirrors `nonSwipeActionRow` in the Video preview sheet.
+    @ViewBuilder
+    private var clusterActionRow: some View {
+        if pendingDeleteCount > 0 {
+            HStack(spacing: 10) {
+                Button {
+                    isShowingTrashBin = true
+                } label: {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "trash.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 48, height: 48)
+                            .background(Color.white.opacity(0.08), in: Circle())
+                        Text("\(pendingDeleteCount)")
+                            .font(CleanupFont.badge(10))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color(hex: "#E63946"), in: Capsule(style: .continuous))
+                            .offset(x: 4, y: -2)
+                    }
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    Task { await deleteSelected() }
+                } label: {
+                    HStack(spacing: 8) {
+                        if isDeleting {
+                            ProgressView().tint(.white)
+                        } else {
+                            Image(systemName: "trash.fill")
+                                .font(.system(size: 14, weight: .bold))
+                        }
+                        Text(isDeleting ? "Deleting…" : "Delete \(pendingDeleteCount)")
+                            .font(CleanupFont.body(15))
+                    }
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(Color(hex: "#E63946"), in: Capsule(style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .disabled(isDeleting)
+            }
+        }
+    }
+
+    private func deleteSelected() async {
+        let ids = assets.map(\.id).filter { selectedAssetIDs.contains($0) }
+        guard !ids.isEmpty, !isDeleting else { return }
+        isDeleting = true
+        statusMessage = nil
+        let success = await appFlow.deleteAssets(with: ids, kind: .duplicateCluster)
+        isDeleting = false
+        if success {
+            for id in ids { selectedAssetIDs.remove(id) }
+            dismiss()
+        } else {
+            statusMessage = "Delete cancelled."
         }
     }
 
@@ -3295,13 +4137,56 @@ private struct ClusterZoomPreviewSheet: View {
         return "Swipe to compare, then tick duplicates you want to remove."
     }
 
+    /// Reviewed counter for cluster previews. In swipe mode the "reviewed"
+    /// axis is the deck (swipeableAssets), in paged mode it's the full
+    /// cluster — pick the one the user is actually flipping through so
+    /// the number feels honest.
+    private var clusterReviewedRow: some View {
+        let total: Int
+        let reviewed: Int
+        if swipeModeActive {
+            total = max(swipeableAssets.count, 1)
+            reviewed = min(swipeIndex + 1, total)
+        } else {
+            total = max(assets.count, 1)
+            reviewed = min(currentIndex + 1, total)
+        }
+        let progress = Double(reviewed) / Double(total)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("\(reviewed) / \(total) reviewed")
+                    .font(CleanupFont.caption(12))
+                    .foregroundStyle(CleanupTheme.textSecondary)
+                Spacer()
+                if selectedAssetIDs.count > 0 {
+                    Text("\(selectedAssetIDs.count) to delete")
+                        .font(CleanupFont.caption(12))
+                        .foregroundStyle(Color(hex: "#E63946"))
+                }
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.08))
+                    Capsule()
+                        .fill(accent)
+                        .frame(width: max(4, geo.size.width * progress))
+                }
+            }
+            .frame(height: 3)
+        }
+    }
+
     private func toggleCurrentSelection() {
         guard let currentAsset, currentAssetProtected == false else { return }
-        if selectedAssetIDs.contains(currentAsset.id) {
-            selectedAssetIDs.remove(currentAsset.id)
-            return
+        toggleSelection(for: currentAsset)
+    }
+
+    private func toggleSelection(for asset: MediaAssetRecord) {
+        if selectedAssetIDs.contains(asset.id) {
+            selectedAssetIDs.remove(asset.id)
+        } else {
+            selectedAssetIDs.insert(asset.id)
         }
-        selectedAssetIDs.insert(currentAsset.id)
     }
 }
 
@@ -3413,13 +4298,22 @@ private struct ZoomableAssetPreview: View {
     let isSelected: Bool
     let accent: Color
     let isVisible: Bool
+    let onTapToToggle: (() -> Void)?
 
-    init(asset: MediaAssetRecord, isProtected: Bool, isSelected: Bool, accent: Color, isVisible: Bool = true) {
+    init(
+        asset: MediaAssetRecord,
+        isProtected: Bool,
+        isSelected: Bool,
+        accent: Color,
+        isVisible: Bool = true,
+        onTapToToggle: (() -> Void)? = nil
+    ) {
         self.asset = asset
         self.isProtected = isProtected
         self.isSelected = isSelected
         self.accent = accent
         self.isVisible = isVisible
+        self.onTapToToggle = onTapToToggle
     }
 
     private var isVideo: Bool { asset.mediaType == .video }
@@ -3435,7 +4329,14 @@ private struct ZoomableAssetPreview: View {
             }
             .background(Color.black.opacity(0.24), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-            .overlay(alignment: .bottomLeading) {
+            // Selection ring around the whole card when marked — much more
+            // obvious than the small bottom-right box, and doesn't re-layout
+            // anything so it can't cause the blinking the user saw.
+            .overlay(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .strokeBorder(isSelected ? accent : Color.clear, lineWidth: 3)
+            )
+            .overlay(alignment: .topLeading) {
                 HStack(spacing: 6) {
                     if isProtected {
                         Text("Best")
@@ -3460,19 +4361,33 @@ private struct ZoomableAssetPreview: View {
                 }
                 .padding(12)
             }
-            .overlay(alignment: .bottomTrailing) {
-                if isProtected == false {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(isSelected ? accent : Color.black.opacity(0.5))
-                        .frame(width: 24, height: 24)
-                        .overlay {
-                            if isSelected {
-                                Image(systemName: "checkmark")
-                                    .font(.system(size: 12, weight: .bold))
-                                    .foregroundStyle(.white)
-                            }
-                        }
-                        .padding(12)
+            .overlay(alignment: .topTrailing) {
+                if isProtected == false && isSelected {
+                    // Static badge, only visible when selected. Sitting in
+                    // the top-right keeps it out of the way of video
+                    // controls and never re-layouts, so no flicker.
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 14, weight: .bold))
+                        Text("Marked")
+                            .font(CleanupFont.badge(11))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(accent.opacity(0.95), in: Capsule(style: .continuous))
+                    .padding(12)
+                }
+            }
+            // Tap anywhere on the image toggles selection — the user shouldn't
+            // have to reach down to the button when the obvious target is
+            // the photo itself. Videos skip this so the tap still goes to
+            // the player's own play/pause controls.
+            .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .onTapGesture {
+                if !isVideo, let onTapToToggle, !isProtected {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    onTapToToggle()
                 }
             }
             .frame(height: 520)
@@ -3485,4 +4400,106 @@ private struct ZoomableAssetPreview: View {
         let seconds = totalSeconds % 60
         return String(format: "%d:%02d", minutes, seconds)
     }
+}
+
+/// Bright top-right badge on the dashboard header. Two states:
+/// - Free → gold "GET PRO" pill that taps straight into the upgrade paywall.
+/// - Pro  → green "PRO" pill (disabled tap).
+/// Flips automatically when EntitlementStore.isPremium changes after
+/// a successful purchase, so no manual refresh post-payment.
+private struct DashboardProBadge: View {
+    let isPremium: Bool
+    let onTap: () -> Void
+
+    @State private var shimmer = false
+
+    var body: some View {
+        Button(action: {
+            guard !isPremium else { return }
+            onTap()
+        }) {
+            HStack(spacing: 5) {
+                Image(systemName: isPremium ? "checkmark.seal.fill" : "crown.fill")
+                    .font(.system(size: 11, weight: .bold))
+                Text(isPremium ? "PRO" : "GET PRO")
+                    .font(.system(size: 12, weight: .heavy, design: .rounded))
+                    .tracking(0.5)
+            }
+            .foregroundStyle(isPremium ? Color.white : Color(hex: "#1C1403"))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(
+                ZStack {
+                    if isPremium {
+                        LinearGradient(
+                            colors: [
+                                Color(hex: "#1E9E6A"),
+                                Color(hex: "#0E6B48")
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    } else {
+                        LinearGradient(
+                            colors: [
+                                Color(hex: "#FFE27A"),
+                                Color(hex: "#FFB63A"),
+                                Color(hex: "#FF8A1E")
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+
+                        GeometryReader { proxy in
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .white.opacity(0),    location: 0.30),
+                                    .init(color: .white.opacity(0.55), location: 0.50),
+                                    .init(color: .white.opacity(0),    location: 0.70),
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                            .frame(width: proxy.size.width * 1.6)
+                            .offset(x: shimmer ? proxy.size.width * 0.6 : -proxy.size.width * 1.0)
+                            .blendMode(.plusLighter)
+                            .allowsHitTesting(false)
+                        }
+                        .clipped()
+                    }
+                }
+            )
+            .clipShape(Capsule(style: .continuous))
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(
+                        isPremium
+                            ? Color.white.opacity(0.25)
+                            : Color.white.opacity(0.55),
+                        lineWidth: 1
+                    )
+            )
+            .shadow(
+                color: (isPremium ? Color(hex: "#1E9E6A") : Color(hex: "#FFB63A")).opacity(0.55),
+                radius: 10, x: 0, y: 4
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isPremium)
+        .onAppear {
+            guard !isPremium else { return }
+            withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: false)) {
+                shimmer = true
+            }
+        }
+    }
+}
+
+/// Visible build marker shown in the dashboard header. Bump `version`
+/// every time clustering code changes so we can tell at a glance
+/// whether the binary on the phone is actually the latest source.
+/// `tag` briefly describes the most recent clustering change.
+enum ClusteringBuild {
+    static let version = 8
+    static let tag = "newest-sort-fix"
 }

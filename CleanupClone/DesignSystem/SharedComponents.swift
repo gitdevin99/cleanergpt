@@ -160,16 +160,27 @@ private struct GlassProminentCTAChrome: ViewModifier {
 }
 
 struct PremiumPill: View {
+    @EnvironmentObject private var appFlow: AppFlow
+    @EnvironmentObject private var entitlements: EntitlementStore
+
     var body: some View {
-        GlassCapsuleBadge {
-            HStack(spacing: 6) {
-                Image(systemName: "star.fill")
-                    .font(.system(size: 10))
-                Text("PRO")
-                    .font(CleanupFont.badge(12))
+        Button {
+            if !entitlements.isPremium {
+                appFlow.requestUpgrade(for: .photoDelete)
             }
-            .foregroundStyle(.white)
+        } label: {
+            GlassCapsuleBadge {
+                HStack(spacing: 6) {
+                    Image(systemName: entitlements.isPremium ? "checkmark.seal.fill" : "sparkles")
+                        .font(.system(size: 10))
+                    Text(entitlements.isPremium ? "PRO" : "Get PRO")
+                        .font(CleanupFont.badge(12))
+                }
+                .foregroundStyle(.white)
+            }
         }
+        .buttonStyle(.plain)
+        .disabled(entitlements.isPremium)
     }
 }
 
@@ -516,75 +527,168 @@ struct PhotoThumbnailView: View {
     }
 }
 
+/// Native-Photos-app preview. The previous version had two bugs:
+///
+///   1. A `PhotoThumbnailView` rendered `scaledToFill` underneath the
+///      `aspectFit` full-res image. That fill extended beyond the fit
+///      rectangle and bled blurry pixels past the sharp image — the
+///      "double preview" the user kept reporting.
+///   2. `resizeMode = .fast` combined with `isNetworkAccessAllowed = false`
+///      meant the image literally never sharpened — the "fast" resize is
+///      permanently low quality, and iCloud photos couldn't download the
+///      real data to sharpen from.
+///
+/// This rewrite:
+///   - Single image layer. No `scaledToFill` underlay. The previous
+///     image stays painted until the next one lands — that's the native
+///     feel, not a ghost fill.
+///   - Two-phase request. First pass: fast degraded, local-only, to
+///     paint something in ~1 frame. Second pass: `.highQualityFormat`
+///     with network access so iCloud photos actually resolve.
+///   - Explicit image size tracking so a crossfade can't leak layout.
 struct PhotoPreviewView: View {
     let localIdentifier: String
 
     private static let previewManager = PHCachingImageManager()
 
-    @State private var image: UIImage?
-    @State private var requestID: PHImageRequestID?
+    /// The currently displayed image. Keyed internally by `displayedID`
+    /// so SwiftUI's transition correctly reads a change in content, not
+    /// just pixels.
+    @State private var displayedImage: UIImage?
+    @State private var displayedID: String = ""
+    @State private var hasHighQuality: Bool = false
+    @State private var fastRequestID: PHImageRequestID?
+    @State private var hqRequestID: PHImageRequestID?
 
     var body: some View {
         ZStack {
+            // Matte underlay so that for the very first frame (before
+            // any image has been delivered) there's a dark card shape
+            // rather than transparency.
             RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(Color.white.opacity(0.04))
+                .fill(Color.black.opacity(0.22))
 
-            if let image {
-                ZoomablePhotoContainer(image: image)
-            } else {
-                ProgressView()
-                    .tint(.white.opacity(0.8))
+            if let displayedImage {
+                ZoomablePhotoContainer(image: displayedImage)
+                    .id(displayedID)
+                    .transition(.opacity)
             }
         }
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .task(id: localIdentifier) {
-            image = nil
+            // Don't clear `displayedImage` here. Keeping the previous
+            // frame visible until the next one lands is what makes
+            // swiping feel continuous instead of flashing blank.
+            hasHighQuality = false
             await loadPreview(for: localIdentifier)
         }
         .onDisappear {
-            cancelPreviewRequest()
+            cancelRequests()
         }
     }
 
-    private func loadPreview(for identifier: String) async {
-        cancelPreviewRequest()
+    // MARK: - Load
 
-        guard let asset = await MainActor.run(body: { PhotoAssetLookup.shared.asset(for: identifier) ?? fallbackAsset(for: identifier) }) else {
-            image = nil
+    private func loadPreview(for identifier: String) async {
+        cancelRequests()
+
+        guard let asset = await MainActor.run(body: {
+            PhotoAssetLookup.shared.asset(for: identifier) ?? fallbackAsset(for: identifier)
+        }) else {
             return
         }
-        let options = PHImageRequestOptions()
-        options.deliveryMode = .highQualityFormat
-        options.resizeMode = .none
-        options.isNetworkAccessAllowed = true
-        options.version = .current
+
+        let scale = UIScreen.main.scale
+        let screen = UIScreen.main.bounds.size
+        let targetSize = CGSize(width: screen.width * scale, height: screen.height * scale)
+
+        // Phase 1 — fast local-only degraded. Purely to paint something
+        // within one frame while the HQ request is still in flight.
+        let fastOptions = PHImageRequestOptions()
+        fastOptions.deliveryMode = .fastFormat
+        fastOptions.resizeMode = .fast
+        fastOptions.isNetworkAccessAllowed = false
+        fastOptions.isSynchronous = false
+        fastOptions.version = .current
+
+        let fastRID = Self.previewManager.requestImage(
+            for: asset,
+            targetSize: targetSize,
+            contentMode: .aspectFit,
+            options: fastOptions
+        ) { uiImage, _ in
+            guard identifier == localIdentifier, !hasHighQuality else { return }
+            guard let uiImage else { return }
+            Task { @MainActor in
+                guard identifier == localIdentifier, !hasHighQuality else { return }
+                withAnimation(.easeOut(duration: 0.12)) {
+                    displayedImage = uiImage
+                    displayedID = identifier + "-fast"
+                }
+            }
+        }
+        await MainActor.run { fastRequestID = fastRID }
+
+        // Phase 2 — high-quality final. Allows iCloud so remote photos
+        // actually resolve, uses `.exact` resize so the result is sharp,
+        // and overrides whatever the fast pass drew.
+        let hqOptions = PHImageRequestOptions()
+        hqOptions.deliveryMode = .highQualityFormat
+        hqOptions.resizeMode = .exact
+        hqOptions.isNetworkAccessAllowed = true
+        hqOptions.isSynchronous = false
+        hqOptions.version = .current
 
         await withCheckedContinuation { continuation in
             var didResume = false
-            requestID = Self.previewManager.requestImageDataAndOrientation(for: asset, options: options) { data, _, _, info in
-                if let data, let uiImage = UIImage(data: data) {
-                    image = uiImage
+            let rid = Self.previewManager.requestImage(
+                for: asset,
+                targetSize: targetSize,
+                contentMode: .aspectFit,
+                options: hqOptions
+            ) { uiImage, info in
+                // Stale — user already swiped past.
+                guard identifier == localIdentifier else {
+                    if !didResume { didResume = true; continuation.resume() }
+                    return
                 }
-
-                let isCancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
+                if let uiImage {
+                    Task { @MainActor in
+                        guard identifier == localIdentifier else { return }
+                        withAnimation(.easeOut(duration: 0.18)) {
+                            displayedImage = uiImage
+                            displayedID = identifier + "-hq"
+                            hasHighQuality = true
+                        }
+                    }
+                }
                 let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-
+                let isCancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
                 guard !didResume, isCancelled || !isDegraded else { return }
                 didResume = true
-                requestID = nil
+                Task { @MainActor in hqRequestID = nil }
                 continuation.resume()
             }
+            Task { @MainActor in hqRequestID = rid }
         }
     }
 
-    private func cancelPreviewRequest() {
-        guard let requestID else { return }
-        Self.previewManager.cancelImageRequest(requestID)
-        self.requestID = nil
+    private func cancelRequests() {
+        if let fastRequestID {
+            Self.previewManager.cancelImageRequest(fastRequestID)
+        }
+        if let hqRequestID {
+            Self.previewManager.cancelImageRequest(hqRequestID)
+        }
+        fastRequestID = nil
+        hqRequestID = nil
     }
 
     @MainActor
     private func fallbackAsset(for identifier: String) -> PHAsset? {
-        let result = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = false
+        let result = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: options)
         guard let asset = result.firstObject else { return nil }
         PhotoAssetLookup.shared.upsert(asset)
         return asset

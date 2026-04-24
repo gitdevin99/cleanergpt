@@ -11,6 +11,7 @@ struct ContactsView: View {
         case duplicates
         case incomplete
         case allContacts
+        case backups
         case cleaning
         case congratulations
     }
@@ -27,6 +28,8 @@ struct ContactsView: View {
                     IncompleteContactsScreen(activeScreen: $activeScreen)
                 case .allContacts:
                     AllContactsScreen(activeScreen: $activeScreen)
+                case .backups:
+                    BackupsScreen(activeScreen: $activeScreen)
                 case .cleaning:
                     CleaningProgressScreen(activeScreen: $activeScreen)
                 case .congratulations:
@@ -35,6 +38,18 @@ struct ContactsView: View {
             }
             .animation(.easeInOut(duration: 0.3), value: activeScreen)
             .navigationBarHidden(true)
+            .onAppear {
+                if let pending = appFlow.pendingContactScreen {
+                    activeScreen = pending
+                    appFlow.pendingContactScreen = nil
+                }
+            }
+            .onChange(of: appFlow.pendingContactScreen) { _, newValue in
+                if let newValue {
+                    activeScreen = newValue
+                    appFlow.pendingContactScreen = nil
+                }
+            }
         }
     }
 }
@@ -139,7 +154,32 @@ private struct ContactsMainScreen: View {
             ) {
                 activeScreen = .allContacts
             }
+
+            contactSectionRow(
+                icon: "externaldrive.fill.badge.person.crop",
+                title: "Backups",
+                count: appFlow.contactBackupService.backups.count,
+                subtitle: backupsSubtitle,
+                color: CleanupTheme.accentCyan,
+                enabled: true
+            ) {
+                activeScreen = .backups
+            }
         }
+    }
+
+    /// Subtitle shown under the Backups row — honest about whether we're
+    /// storing in iCloud or locally, and shows last backup date if we have one.
+    private var backupsSubtitle: String {
+        if let last = appFlow.contactBackupService.lastBackupDate {
+            let df = DateFormatter()
+            df.dateFormat = "MMM d, yyyy"
+            let prefix = appFlow.contactBackupService.isUsingICloud ? "Last iCloud backup" : "Last backup"
+            return "\(prefix): \(df.string(from: last))"
+        }
+        return appFlow.contactBackupService.isUsingICloud
+            ? "Save a copy to iCloud"
+            : "Save a local copy of your contacts"
     }
 
     private func contactSectionRow(
@@ -196,219 +236,339 @@ private struct ContactsMainScreen: View {
 private struct DuplicateMergeScreen: View {
     @EnvironmentObject private var appFlow: AppFlow
     @Binding var activeScreen: ContactsView.ContactScreen
-    @State private var selectedGroupIDs: Set<String> = []
-    @State private var expandedGroupID: String?
+
+    /// Per-contact selection. A group is merged if it has 2+ selected contacts
+    /// (you can't merge a group down to one without duplicates to fold in).
+    /// Default on first open: every contact selected — matches the competitor
+    /// screenshot where everything is checked out of the gate.
+    @State private var selectedContactIDs: Set<String> = []
+    @State private var showMergePreview = false
 
     private var groups: [DuplicateContactGroup] {
         appFlow.duplicateContactGroups
+    }
+
+    /// Groups where the user has kept enough contacts selected to actually
+    /// perform a merge (need at least 2 to fold together).
+    private var mergeableGroups: [DuplicateContactGroup] {
+        groups.compactMap { group in
+            let kept = group.contacts.filter { selectedContactIDs.contains($0.id) }
+            return kept.count >= 2 ? group : nil
+        }
+    }
+
+    private var totalContactsToMerge: Int {
+        mergeableGroups.reduce(0) { $0 + max(0, $1.duplicateCount - 1) }
+    }
+
+    private var totalSelected: Int {
+        // Across all groups, how many contact rows are currently checked.
+        let allIDs = Set(groups.flatMap { $0.contacts.map(\.id) })
+        return selectedContactIDs.intersection(allIDs).count
+    }
+
+    private var allContactIDs: Set<String> {
+        Set(groups.flatMap { $0.contacts.map(\.id) })
     }
 
     var body: some View {
         FeatureScreen(
             title: "Duplicates",
             leadingSymbol: "chevron.left",
-            leadingAction: { activeScreen = .main }
+            leadingAction: { activeScreen = .main },
+            trailingContent: {
+                Button {
+                    toggleSelectAllGlobal()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: selectedContactIDs == allContactIDs
+                              ? "checkmark.circle.fill"
+                              : "checkmark.circle")
+                            .font(.system(size: 14, weight: .semibold))
+                        Text(selectedContactIDs == allContactIDs ? "Deselect All" : "Select All")
+                            .font(CleanupFont.body(14))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(
+                        Capsule().fill(CleanupTheme.card.opacity(0.8))
+                    )
+                }
+            }
         ) {
             VStack(spacing: 0) {
-                // Top bar with select all
+                // Count line under the title, like the competitor's "89 Contacts"
                 HStack {
-                    Text("\(groups.count) duplicate groups")
-                        .font(CleanupFont.body(14))
+                    Text("\(appFlow.contactAnalysisSummary.duplicateContactCount) Contacts")
+                        .font(CleanupFont.body(15))
                         .foregroundStyle(CleanupTheme.textSecondary)
                     Spacer()
-                    Button {
-                        if selectedGroupIDs.count == groups.count {
-                            selectedGroupIDs.removeAll()
-                        } else {
-                            selectedGroupIDs = Set(groups.map(\.id))
-                        }
-                    } label: {
-                        Text(selectedGroupIDs.count == groups.count ? "Deselect all" : "Select all")
-                            .font(CleanupFont.body(14))
-                            .foregroundStyle(CleanupTheme.electricBlue)
-                    }
                 }
                 .padding(.bottom, 12)
 
-                // Groups list
                 ScrollView(showsIndicators: false) {
-                    LazyVStack(spacing: 10) {
+                    LazyVStack(spacing: 14) {
                         ForEach(groups) { group in
                             DuplicateGroupCard(
                                 group: group,
-                                isSelected: selectedGroupIDs.contains(group.id),
-                                isExpanded: expandedGroupID == group.id,
-                                onToggleSelect: {
-                                    if selectedGroupIDs.contains(group.id) {
-                                        selectedGroupIDs.remove(group.id)
-                                    } else {
-                                        selectedGroupIDs.insert(group.id)
-                                    }
-                                },
-                                onToggleExpand: {
-                                    withAnimation(.easeInOut(duration: 0.25)) {
-                                        expandedGroupID = expandedGroupID == group.id ? nil : group.id
-                                    }
-                                }
+                                selectedContactIDs: $selectedContactIDs
                             )
                         }
                     }
-                    .padding(.bottom, 100)
+                    .padding(.bottom, totalContactsToMerge > 0 ? 100 : 24)
                 }
 
-                // Bottom merge button
-                if !selectedGroupIDs.isEmpty {
-                    let selectedGroups = groups.filter { selectedGroupIDs.contains($0.id) }
-                    let totalMerge = selectedGroups.reduce(0) { $0 + max(0, $1.duplicateCount - 1) }
-
-                    PrimaryCTAButton(title: "Merge \(selectedGroupIDs.count) groups (\(totalMerge) contacts)") {
-                        let toMerge = selectedGroups
-                        activeScreen = .cleaning
-                        Task {
-                            _ = await appFlow.bulkMergeDuplicateContacts(groups: toMerge)
-                            try? await Task.sleep(nanoseconds: 500_000_000)
-                            activeScreen = .congratulations
-                        }
+                // Bottom CTA — single action, matches competitor's "See Merge Preview"
+                if totalContactsToMerge > 0 {
+                    PrimaryCTAButton(title: "See Merge Preview") {
+                        showMergePreview = true
                     }
                     .padding(.top, 8)
                 }
             }
         }
         .onAppear {
-            selectedGroupIDs = Set(groups.map(\.id))
+            // Default: every contact in every group is selected — so the user
+            // can tap straight to Merge Preview without fiddling.
+            if selectedContactIDs.isEmpty {
+                selectedContactIDs = allContactIDs
+            }
+        }
+        .sheet(isPresented: $showMergePreview) {
+            MergePreviewSheet(
+                groups: mergeableGroups,
+                totalContactsToMerge: totalContactsToMerge,
+                onConfirm: {
+                    showMergePreview = false
+                    startMerge()
+                }
+            )
+        }
+    }
+
+    private func toggleSelectAllGlobal() {
+        if selectedContactIDs == allContactIDs {
+            selectedContactIDs.removeAll()
+        } else {
+            selectedContactIDs = allContactIDs
+        }
+    }
+
+    private func startMerge() {
+        guard appFlow.gateSingleAction(.contactMerge) else { return }
+        let toMerge = mergeableGroups
+        activeScreen = .cleaning
+        Task {
+            _ = await appFlow.bulkMergeDuplicateContacts(groups: toMerge)
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            activeScreen = .congratulations
         }
     }
 }
 
+/// Flat card — shows the group title + every contact inline with a red
+/// checkbox each, and a per-group "Select All / Deselect All" control. No
+/// accordion, no hidden rows. Directly modeled on the competitor screenshot.
 private struct DuplicateGroupCard: View {
     let group: DuplicateContactGroup
-    let isSelected: Bool
-    let isExpanded: Bool
-    let onToggleSelect: () -> Void
-    let onToggleExpand: () -> Void
+    @Binding var selectedContactIDs: Set<String>
 
-    var body: some View {
-        GlassCard(cornerRadius: 20) {
-            VStack(alignment: .leading, spacing: 0) {
-                // Header row
-                HStack(spacing: 12) {
-                    // Checkbox
-                    Button(action: onToggleSelect) {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .strokeBorder(isSelected ? CleanupTheme.electricBlue : Color.white.opacity(0.3), lineWidth: 1.5)
-                                .frame(width: 22, height: 22)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .fill(isSelected ? CleanupTheme.electricBlue : Color.clear)
-                                )
-                            if isSelected {
-                                Image(systemName: "checkmark")
-                                    .font(.system(size: 12, weight: .bold))
-                                    .foregroundStyle(.white)
-                            }
-                        }
-                    }
-                    .buttonStyle(.plain)
-
-                    // Contact avatar
-                    ContactAvatar(initials: group.mergedPreview.initials, size: 40)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(group.title)
-                            .font(CleanupFont.sectionTitle(16))
-                            .foregroundStyle(.white)
-                        Text("\(group.duplicateCount) contacts • \(group.secondaryLine)")
-                            .font(CleanupFont.caption(11))
-                            .foregroundStyle(CleanupTheme.textSecondary)
-                            .lineLimit(1)
-                    }
-
-                    Spacer()
-
-                    Button(action: onToggleExpand) {
-                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.5))
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                // Expanded detail
-                if isExpanded {
-                    VStack(alignment: .leading, spacing: 10) {
-                        // Merged preview
-                        HStack(spacing: 10) {
-                            Image(systemName: "arrow.triangle.merge")
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundStyle(CleanupTheme.accentGreen)
-                            Text("Merged contact")
-                                .font(CleanupFont.body(13))
-                                .foregroundStyle(CleanupTheme.accentGreen)
-                        }
-                        .padding(.top, 12)
-
-                        mergedPreviewCard
-
-                        Text("Contacts to merge")
-                            .font(CleanupFont.body(13))
-                            .foregroundStyle(CleanupTheme.textSecondary)
-                            .padding(.top, 4)
-
-                        ForEach(group.contacts) { contact in
-                            contactDetailRow(contact)
-                        }
-                    }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-            }
-        }
+    private var allGroupSelected: Bool {
+        group.contacts.allSatisfy { selectedContactIDs.contains($0.id) }
     }
 
-    private var mergedPreviewCard: some View {
-        HStack(spacing: 12) {
-            ContactAvatar(initials: group.mergedPreview.initials, size: 36, color: CleanupTheme.accentGreen)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(group.mergedPreview.fullName)
-                    .font(CleanupFont.body(14))
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Header with per-group Select All / Deselect All
+            HStack {
+                Text("\(group.duplicateCount) Duplicate Contacts")
+                    .font(CleanupFont.sectionTitle(16))
                     .foregroundStyle(.white)
-                if !group.mergedPreview.phones.isEmpty {
-                    Text(group.mergedPreview.phones.joined(separator: " • "))
-                        .font(CleanupFont.caption(11))
-                        .foregroundStyle(CleanupTheme.textSecondary)
-                        .lineLimit(1)
+                Spacer()
+                Button {
+                    toggleGroupSelectAll()
+                } label: {
+                    Text(allGroupSelected ? "Deselect All" : "Select All")
+                        .font(CleanupFont.body(13))
+                        .foregroundStyle(allGroupSelected
+                                         ? CleanupTheme.textSecondary
+                                         : CleanupTheme.electricBlue)
                 }
-                if !group.mergedPreview.emails.isEmpty {
-                    Text(group.mergedPreview.emails.joined(separator: " • "))
-                        .font(CleanupFont.caption(11))
-                        .foregroundStyle(CleanupTheme.textTertiary)
-                        .lineLimit(1)
+                .buttonStyle(.plain)
+            }
+
+            // Every duplicate contact laid out directly — no tap to expand.
+            VStack(spacing: 10) {
+                ForEach(group.contacts) { contact in
+                    duplicateRow(contact)
                 }
             }
-            Spacer()
         }
-        .padding(10)
+        .padding(14)
         .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(CleanupTheme.accentGreen.opacity(0.08))
-                .strokeBorder(CleanupTheme.accentGreen.opacity(0.2), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(CleanupTheme.card.opacity(0.55))
         )
     }
 
-    private func contactDetailRow(_ contact: ContactRecord) -> some View {
-        HStack(spacing: 10) {
-            ContactAvatar(initials: contact.initials, size: 32)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(contact.fullName)
-                    .font(CleanupFont.body(13))
-                    .foregroundStyle(.white)
-                Text(contact.phones.first ?? contact.emails.first ?? "No details")
-                    .font(CleanupFont.caption(11))
-                    .foregroundStyle(CleanupTheme.textTertiary)
+    private func duplicateRow(_ contact: ContactRecord) -> some View {
+        let isSelected = selectedContactIDs.contains(contact.id)
+        let primaryDetail = contact.phones.first ?? contact.emails.first ?? "No phone or email"
+        return Button {
+            toggleContact(contact.id)
+        } label: {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(contact.fullName.isEmpty ? "Unnamed Contact" : contact.fullName)
+                        .font(CleanupFont.body(15).weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text(primaryDetail)
+                        .font(CleanupFont.caption(12))
+                        .foregroundStyle(CleanupTheme.textSecondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                // Red circular checkbox, matching the competitor's visual.
+                ZStack {
+                    Circle()
+                        .strokeBorder(
+                            isSelected ? Color.clear : Color.white.opacity(0.35),
+                            lineWidth: 1.5
+                        )
+                        .background(
+                            Circle().fill(isSelected ? CleanupTheme.accentRed : Color.clear)
+                        )
+                        .frame(width: 26, height: 26)
+                    if isSelected {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.white)
+                    }
+                }
             }
-            Spacer()
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(CleanupTheme.background.opacity(0.6))
+            )
+            .contentShape(Rectangle())
         }
-        .padding(.vertical, 2)
+        .buttonStyle(.plain)
+    }
+
+    private func toggleContact(_ id: String) {
+        if selectedContactIDs.contains(id) {
+            selectedContactIDs.remove(id)
+        } else {
+            selectedContactIDs.insert(id)
+        }
+    }
+
+    private func toggleGroupSelectAll() {
+        if allGroupSelected {
+            for contact in group.contacts { selectedContactIDs.remove(contact.id) }
+        } else {
+            for contact in group.contacts { selectedContactIDs.insert(contact.id) }
+        }
+    }
+}
+
+/// Preview sheet that shows what the merged contacts will look like before
+/// the user commits. The old accordion lived inline and buried this; now
+/// it's one tap from a clearly-labeled CTA.
+private struct MergePreviewSheet: View {
+    let groups: [DuplicateContactGroup]
+    let totalContactsToMerge: Int
+    let onConfirm: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                CleanupTheme.background.ignoresSafeArea()
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 14) {
+                        ForEach(groups) { group in
+                            mergedGroupCard(group)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                    .padding(.bottom, 120)
+                }
+
+                VStack {
+                    Spacer()
+                    PrimaryCTAButton(
+                        title: "Merge \(groups.count) group\(groups.count == 1 ? "" : "s") (\(totalContactsToMerge) contact\(totalContactsToMerge == 1 ? "" : "s"))"
+                    ) {
+                        onConfirm()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
+                }
+            }
+            .navigationTitle("Merge Preview")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Cancel") { dismiss() }
+                        .foregroundStyle(CleanupTheme.electricBlue)
+                }
+            }
+        }
+    }
+
+    private func mergedGroupCard(_ group: DuplicateContactGroup) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.triangle.merge")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(CleanupTheme.accentGreen)
+                Text("Merged contact")
+                    .font(CleanupFont.body(13))
+                    .foregroundStyle(CleanupTheme.accentGreen)
+            }
+            HStack(spacing: 12) {
+                ContactAvatar(
+                    initials: group.mergedPreview.initials,
+                    size: 38,
+                    color: CleanupTheme.accentGreen
+                )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(group.mergedPreview.fullName)
+                        .font(CleanupFont.body(15).weight(.semibold))
+                        .foregroundStyle(.white)
+                    if !group.mergedPreview.phones.isEmpty {
+                        Text(group.mergedPreview.phones.joined(separator: " • "))
+                            .font(CleanupFont.caption(12))
+                            .foregroundStyle(CleanupTheme.textSecondary)
+                            .lineLimit(2)
+                    }
+                    if !group.mergedPreview.emails.isEmpty {
+                        Text(group.mergedPreview.emails.joined(separator: " • "))
+                            .font(CleanupFont.caption(12))
+                            .foregroundStyle(CleanupTheme.textTertiary)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer()
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(CleanupTheme.accentGreen.opacity(0.08))
+                    .strokeBorder(CleanupTheme.accentGreen.opacity(0.22), lineWidth: 1)
+            )
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(CleanupTheme.card.opacity(0.55))
+        )
     }
 }
 
@@ -1104,4 +1264,325 @@ private extension String {
     func ifEmpty(_ fallback: String) -> String {
         isEmpty ? fallback : self
     }
+}
+
+// MARK: - Backups Screen
+
+private struct BackupsScreen: View {
+    @EnvironmentObject private var appFlow: AppFlow
+    @Binding var activeScreen: ContactsView.ContactScreen
+
+    @State private var selectedBackupIDs: Set<String> = []
+    @State private var showRestoreConfirm = false
+    @State private var showDeleteConfirm = false
+    @State private var statusMessage: String?
+    @State private var backupTarget: ContactBackup?
+
+    private var service: ContactBackupService { appFlow.contactBackupService }
+    private var backups: [ContactBackup] { service.backups }
+    private var isAllSelected: Bool {
+        !backups.isEmpty && selectedBackupIDs.count == backups.count
+    }
+    private var sectionTitle: String {
+        service.isUsingICloud ? "iCloud backups" : "Backups"
+    }
+
+    var body: some View {
+        FeatureScreen(
+            title: "Backups",
+            leadingSymbol: "chevron.left",
+            leadingAction: { activeScreen = .main },
+            trailingContent: {
+                if !backups.isEmpty {
+                    Button {
+                        toggleSelectAll()
+                    } label: {
+                        Text(isAllSelected ? "Deselect all" : "Select all")
+                            .font(CleanupFont.body(14))
+                            .foregroundStyle(CleanupTheme.electricBlue)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                    }
+                }
+            }
+        ) {
+            VStack(spacing: 0) {
+                autoBackupCard
+                    .padding(.bottom, 18)
+
+                if backups.isEmpty {
+                    emptyState
+                } else {
+                    backupsList
+                }
+
+                Spacer(minLength: 12)
+
+                bottomActions
+            }
+        }
+        .onAppear {
+            service.refreshBackups()
+        }
+        .alert("Restore selected backup?", isPresented: $showRestoreConfirm, presenting: backupTarget) { backup in
+            Button("Cancel", role: .cancel) {}
+            Button("Restore") {
+                Task { await restore(backup: backup) }
+            }
+        } message: { backup in
+            Text("This will add \(backup.contactCount) contacts from \(Self.longDateFormatter.string(from: backup.createdAt)) to your address book. Existing contacts are not changed. You may see duplicates afterward — use the Duplicate merger to clean them up.")
+        }
+        .alert("Delete \(selectedBackupIDs.count) backup\(selectedBackupIDs.count == 1 ? "" : "s")?", isPresented: $showDeleteConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                deleteSelected()
+            }
+        } message: {
+            Text("This only removes the backup file. Your contacts are not affected.")
+        }
+    }
+
+    // MARK: - Subviews
+
+    private var autoBackupCard: some View {
+        GlassCard(cornerRadius: 18) {
+            HStack(spacing: 14) {
+                Text("Auto-backup")
+                    .font(CleanupFont.body(16))
+                    .foregroundStyle(.white)
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { service.autoBackupEnabled },
+                    set: { service.autoBackupEnabled = $0 }
+                ))
+                .labelsHidden()
+                .tint(CleanupTheme.electricBlue)
+            }
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "externaldrive.badge.icloud")
+                .font(.system(size: 44, weight: .light))
+                .foregroundStyle(CleanupTheme.textSecondary)
+                .padding(.top, 40)
+            Text("No backups yet")
+                .font(CleanupFont.sectionTitle(18))
+                .foregroundStyle(.white)
+            Text(service.isUsingICloud
+                 ? "Tap Backup now to save a copy of your \(appFlow.contactAnalysisSummary.totalCount) contacts to iCloud."
+                 : "Tap Backup now to save a copy of your \(appFlow.contactAnalysisSummary.totalCount) contacts locally.")
+                .font(CleanupFont.body(13))
+                .foregroundStyle(CleanupTheme.textSecondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var backupsList: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: service.isUsingICloud ? "icloud.fill" : "internaldrive.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(CleanupTheme.textSecondary)
+                    .frame(width: 28, height: 28)
+                    .background(
+                        Circle().fill(Color.white.opacity(0.06))
+                    )
+                Text(sectionTitle)
+                    .font(CleanupFont.body(15))
+                    .foregroundStyle(CleanupTheme.textSecondary)
+                Spacer()
+            }
+            .padding(.horizontal, 4)
+
+            ScrollView(showsIndicators: false) {
+                LazyVStack(spacing: 0) {
+                    ForEach(backups) { backup in
+                        backupRow(backup)
+                        if backup.id != backups.last?.id {
+                            Divider()
+                                .overlay(Color.white.opacity(0.05))
+                                .padding(.leading, 56)
+                        }
+                    }
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(CleanupTheme.card.opacity(0.6))
+                )
+            }
+            .frame(maxHeight: 360)
+        }
+    }
+
+    private func backupRow(_ backup: ContactBackup) -> some View {
+        let isSelected = selectedBackupIDs.contains(backup.id)
+        return Button {
+            backupTarget = backup
+            showRestoreConfirm = true
+        } label: {
+            HStack(spacing: 12) {
+                Button {
+                    toggleSelection(for: backup)
+                } label: {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .strokeBorder(isSelected ? CleanupTheme.electricBlue : Color.white.opacity(0.3), lineWidth: 1.5)
+                            .frame(width: 20, height: 20)
+                            .background(
+                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                    .fill(isSelected ? CleanupTheme.electricBlue : Color.clear)
+                            )
+                        if isSelected {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(.white)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(Self.dateFormatter.string(from: backup.createdAt))
+                        .font(CleanupFont.body(15))
+                        .foregroundStyle(.white)
+                    Text("at " + Self.timeFormatter.string(from: backup.createdAt))
+                        .font(CleanupFont.caption(12))
+                        .foregroundStyle(CleanupTheme.textSecondary)
+                }
+
+                Spacer()
+
+                Text("\(backup.contactCount)")
+                    .font(CleanupFont.body(15))
+                    .foregroundStyle(CleanupTheme.electricBlue)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(CleanupTheme.electricBlue)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .contentShape(Rectangle())
+            .background(
+                isSelected ? Color.white.opacity(0.04) : Color.clear
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var bottomActions: some View {
+        VStack(spacing: 10) {
+            if let statusMessage {
+                Text(statusMessage)
+                    .font(CleanupFont.caption(12))
+                    .foregroundStyle(CleanupTheme.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 6)
+            }
+
+            if !selectedBackupIDs.isEmpty {
+                // Restore (secondary) + Delete (primary) layout, matching the
+                // competitor's two-button footer when selection is active.
+                Button {
+                    if let backup = backups.first(where: { selectedBackupIDs.contains($0.id) }) {
+                        backupTarget = backup
+                        showRestoreConfirm = true
+                    }
+                } label: {
+                    Text("Restore backup")
+                        .font(CleanupFont.body(16))
+                        .foregroundStyle(CleanupTheme.electricBlue)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .strokeBorder(CleanupTheme.electricBlue.opacity(0.6), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(selectedBackupIDs.count != 1)
+                .opacity(selectedBackupIDs.count == 1 ? 1 : 0.45)
+
+                PrimaryCTAButton(title: "Delete \(selectedBackupIDs.count) backup\(selectedBackupIDs.count == 1 ? "" : "s")") {
+                    showDeleteConfirm = true
+                }
+            } else {
+                PrimaryCTAButton(title: service.isWorking ? "Backing up…" : "Backup now") {
+                    Task { await backupNow() }
+                }
+                .disabled(service.isWorking)
+                .opacity(service.isWorking ? 0.6 : 1)
+            }
+        }
+        .padding(.top, 10)
+    }
+
+    // MARK: - Actions
+
+    private func toggleSelection(for backup: ContactBackup) {
+        if selectedBackupIDs.contains(backup.id) {
+            selectedBackupIDs.remove(backup.id)
+        } else {
+            selectedBackupIDs.insert(backup.id)
+        }
+    }
+
+    private func toggleSelectAll() {
+        if isAllSelected {
+            selectedBackupIDs.removeAll()
+        } else {
+            selectedBackupIDs = Set(backups.map(\.id))
+        }
+    }
+
+    private func backupNow() async {
+        statusMessage = nil
+        if let result = await service.createBackup() {
+            statusMessage = "Saved \(result.contactCount) contacts."
+            // Refresh count on dashboard card too.
+            await appFlow.scanContacts()
+        } else {
+            statusMessage = "Couldn't create backup. Please try again."
+        }
+    }
+
+    private func restore(backup: ContactBackup) async {
+        statusMessage = nil
+        let added = await service.restoreBackup(backup)
+        if added > 0 {
+            statusMessage = "Restored \(added) contacts."
+            await appFlow.scanContacts()
+        } else {
+            statusMessage = "Restore failed or no contacts to restore."
+        }
+    }
+
+    private func deleteSelected() {
+        let toDelete = backups.filter { selectedBackupIDs.contains($0.id) }
+        service.deleteBackups(toDelete)
+        selectedBackupIDs.removeAll()
+        Task { await appFlow.scanContacts() }
+    }
+
+    // Formatters
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d, yyyy"
+        return f
+    }()
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "h:mm a"
+        return f
+    }()
+    private static let longDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
 }

@@ -5,6 +5,7 @@ import CoreImage
 import CryptoKit
 import EventKit
 import Foundation
+import LocalAuthentication
 @preconcurrency import Photos
 @preconcurrency import PhotosUI
 import SwiftUI
@@ -13,9 +14,42 @@ import UniformTypeIdentifiers
 import Vision
 
 enum AppStage {
+    /// Load-bearing launch splash. Holds for ~2.4s while SDKs warm
+    /// and onboarding assets decode in the background. Auto-advances
+    /// to `.onboarding` (or `.mainApp` if the user has already
+    /// completed onboarding) via `SplashView`.
+    case splash
     case onboarding
     case paywall
     case mainApp
+}
+
+/// User-facing appearance preference. Light mode is defined but intentionally
+/// not exposed in the Themes picker until every screen has been audited for
+/// contrast in light backgrounds. Keeping the case here so the enum is stable
+/// when Light is rolled out in a follow-up release.
+enum AppAppearance: String, CaseIterable, Identifiable {
+    case automatic
+    case dark
+    case light  // not selectable yet – shown as "Coming soon" in the UI
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .automatic: "Automatic"
+        case .dark: "Dark"
+        case .light: "Light"
+        }
+    }
+
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .automatic: nil
+        case .dark: .dark
+        case .light: .light
+        }
+    }
 }
 
 enum CleanupTab: String, CaseIterable, Identifiable {
@@ -506,9 +540,15 @@ final class AppFlow: ObservableObject {
     nonisolated(unsafe) private static let indexingTargetSize = CGSize(width: 256, height: 256)
     nonisolated(unsafe) private static let indexingImageManager = PHCachingImageManager()
 
-    @Published var stage: AppStage = .onboarding
+    @Published var stage: AppStage = .splash
     @Published var selectedTab: CleanupTab = .home
     @Published var onboardingIndex = 0
+    @Published var pendingUpgradeGate: UpgradeGateContext?
+    /// Direct-entry flag for the upgrade paywall — toggled by the
+    /// dashboard PRO badge and any other "take me straight to the
+    /// paywall" CTA. RootView observes this and drives the
+    /// `UpgradePaywallSheet` fullScreenCover.
+    @Published var presentUpgradePaywall: Bool = false
 
     @Published var storageSnapshot = StorageSnapshot.current()
     @Published var deviceSnapshot = DeviceSnapshot.current()
@@ -520,6 +560,13 @@ final class AppFlow: ObservableObject {
     @Published var scanStatusText = "Ready to scan"
     @Published var scannedLibraryItems = 0
     @Published var refiningClusterCategories: Set<DashboardCategoryKind> = []
+    /// Categories that are queued for refinement but haven't yet
+    /// started running (refinements happen sequentially to avoid
+    /// saturating the Neural Engine). UI treats "queued" the same as
+    /// "running" so the user sees a "Refining…" indicator on every
+    /// card that's going to be refined, not just the one currently
+    /// being worked on.
+    @Published var pendingRefinementCategories: Set<DashboardCategoryKind> = []
     @Published var dashboardCategories: [DashboardCategorySummary] = DashboardCategoryKind.allCases.map {
         DashboardCategorySummary(kind: $0, count: 0, totalBytes: 0)
     }
@@ -545,6 +592,19 @@ final class AppFlow: ObservableObject {
     @Published var secretVaultItems: [SecretVaultItem] = []
     @Published var secretVaultImportStatus: SecretVaultImportStatus?
     @Published var isSecretSpaceUnlocked = false
+    /// Deep-link request: when set, ContactsView will switch to this sub-screen
+    /// on appear/change and then clear it. Used by the Dashboard to jump
+    /// straight to Duplicates / Incomplete / All Contacts / Backups.
+    @Published var pendingContactScreen: ContactsView.ContactScreen?
+    /// Service that creates / lists / restores / deletes contact backups.
+    /// Lives on AppFlow so views and background actions share the same state.
+    let contactBackupService = ContactBackupService()
+    /// User-chosen appearance (Automatic / Dark). "Light" is intentionally not
+    /// available yet — shipping it half-baked would leave screens with white
+    /// text on white backgrounds. Persisted across launches.
+    @Published var appearancePreference: AppAppearance {
+        didSet { UserDefaults.standard.set(appearancePreference.rawValue, forKey: "cleanup.appearance") }
+    }
     @Published var selectedChargingPosterID = "Battery"
     @Published var appliedChargingPosterID = "Battery"
     @Published var compressionResults: [String: MediaCompressionResult] = [:]
@@ -557,6 +617,13 @@ final class AppFlow: ObservableObject {
 
     private(set) var mediaAssetsByCategory: [DashboardCategoryKind: [MediaAssetRecord]] = [:]
     private(set) var mediaClustersByCategory: [DashboardCategoryKind: [MediaCluster]] = [:]
+    /// IDs of assets the background screen-recording classifier has
+    /// confirmed match iOS screen-recording filename patterns. This
+    /// outlives individual `applyLibrarySnapshot` calls so that every
+    /// snapshot the scan publishes carries the classifier's results
+    /// forward — otherwise the snapshot would wipe the promoted
+    /// records from `.screenRecordings` every time it ran.
+    private var confirmedScreenRecordingIDs: Set<String> = []
     private(set) var totalLibraryItems = 0
     private(set) var photoCount = 0
     private(set) var videoCount = 0
@@ -582,22 +649,189 @@ final class AppFlow: ObservableObject {
     private let gmailService = GmailService.shared
     private var libraryScanGeneration = 0
     private var activeLibraryScanTask: Task<Void, Never>?
+    /// When did the last successful library scan finish. Used to throttle
+    /// `didBecomeActive`-triggered rescans — without this, every time the
+    /// user opens a preview sheet (which trips didBecomeActive on return)
+    /// we'd blow away all the Vision/clustering caches and rebuild them
+    /// from scratch. That was the "it keeps re-indexing" bug.
+    private var lastLibraryScanAt: Date?
+    /// Minimum interval between auto-triggered rescans. Manual pull-to-
+    /// refresh and first-load always go through.
+    private let autoRescanCooldown: TimeInterval = 180
     private let librarySnapshotBatchSize = 240
     private let quickScanReadyCount = 4_000
     private var clusterRefinementSignature: [DashboardCategoryKind: Int] = [:]
     private var visualSignatureCache: [String: MediaVisualSignature] = [:]
     private var semanticFeaturePrintCache: [String: VNFeaturePrintObservation] = [:]
     private var faceCountCache: [String: Int] = [:]
+    /// Per-face feature prints, up to `maxFacesPerAsset` largest faces per
+    /// image. Used by `.similar` clustering so "me at the Louvre" and
+    /// "my girlfriend at the Louvre" don't collapse into one cluster just
+    /// because the scene feature print is close. An empty array means
+    /// "we computed and found no usable face crops" — distinct from
+    /// "not computed yet" (nil).
+    private var faceEmbeddingsCache: [String: [VNFeaturePrintObservation]] = [:]
+    /// Pixel-level fingerprint for duplicate detection. SHA256 over a
+    /// normalized 64×64 grayscale buffer — two images with matching
+    /// fingerprints are pixel-identical up to JPEG jitter. Used as
+    /// the final gate for `.duplicates` so "90 GB of duplicates" can't
+    /// happen — only bit-for-bit matches end up in the duplicate view.
+    private var pixelFingerprintCache: [String: Data] = [:]
+    /// Byte-exact file size per asset, keyed by `localIdentifier +
+    /// modificationDate`. First scan pays the PHAssetResource lookup
+    /// (which is what triggers Photos' "Missing prefetched properties …
+    /// Fetching on demand on the main queue" warning). Every rescan
+    /// after that short-circuits here, so the warning fires at most
+    /// once per asset per install instead of 30K times per scan.
+    private var fileSizeCache: [String: Int64] = [:]
+    /// Lowercased original filename for video assets, populated by the
+    /// scan preflight. Used by `isScreenRecordingAsset` to skip the
+    /// synchronous `PHAssetResource.assetResources(for:)` call (which
+    /// would otherwise trigger Photos' "Fetching on demand on the main
+    /// queue" warning and serialise every video check on MainActor).
+    /// A `nil` value means we tried and got no filename back; missing
+    /// key means we haven't preflighted yet so the old sync path runs.
+    private var originalFilenameCache: [String: String?] = [:]
+    /// Cap the number of faces we embed per asset. Group photos still
+    /// cluster correctly (we require every anchor face to match), but
+    /// we don't pay O(n²) on a 30-person banquet photo.
+    private let maxFacesPerAsset = 4
+    /// Feature-print distance under which two face crops are considered
+    /// the same identity. Vision's face-crop feature prints land roughly
+    /// 8-14 apart for the same person and 18+ for different people, so
+    /// 14 is an aggressive threshold that splits different identities
+    /// while still tolerating pose / lighting variation in a burst.
+    /// Lower = stricter (more false splits); higher = looser (more
+    /// false merges). Tuned specifically to stop "me + my partner at
+    /// the Louvre" from being called similar.
+    private let faceIdentityDistanceThreshold: Float = 14.0
+
+    // MARK: - Incremental-scan cache
+    //
+    // The full scan produces both a final snapshot (categorized +
+    // clusters) and the intermediate bucket dicts that snapshot was
+    // built from. For incremental updates we keep the buckets and the
+    // last `PHFetchResult` around so a `PHPhotoLibraryChangeObserver`
+    // callback can:
+    //   • ask iOS exactly which assets were inserted / removed /
+    //     changed via `PHChange.changeDetails(for:)`,
+    //   • patch the buckets in place (same routing code paths as
+    //     a full scan — no result divergence),
+    //   • rerun `applyLibrarySnapshot` against the patched buckets.
+    // Vision / feature-print / face-count caches are preserved across
+    // the delta: we only invalidate the entries for removed/changed
+    // assets. That's the "no re-index mid-browse" fix — new screenshots
+    // surface within a second or two without touching existing work.
+    private var lastLibraryFetchResult: PHFetchResult<PHAsset>?
+    private var lastLibraryBuckets: LibraryBucketsCache?
     private let clusterThumbnailManager = PHCachingImageManager()
     private let mediaAnalysisStore = MediaAnalysisStore()
 
+    /// Bridge to `PHPhotoLibrary` change notifications. Without this, newly-
+    /// taken screenshots / deleted items don't show up until the user hits
+    /// Refresh — and even then only after `autoRescanCooldown` elapses.
+    /// With it registered, iOS pings us the instant the library changes
+    /// and we kick off a fresh scan automatically.
+    private var photoLibraryObserver: PhotoLibraryChangeBridge?
+    /// Debounce handle so a burst of `photoLibraryDidChange` callbacks
+    /// is coalesced into a single rescan (or skipped entirely if the
+    /// cooldown is still active).
+    private var photoLibraryChangeDebounce: Task<Void, Never>?
+    /// Holds the most recent `PHChange` that arrived while a full scan
+    /// was in progress. Without this we used to drop those changes on
+    /// the floor, which meant a mid-scan delete stayed in the scan's
+    /// pre-delete bucket snapshot — `verifyDuplicatesByPixel` would
+    /// then briefly show Duplicates as "0 / Zero KB" while it threw the
+    /// missing assets out. Draining this after the scan completes lets
+    /// us patch those deltas surgically.
+    private var pendingLibraryChange: PHChange?
+
     init() {
+        // Load persisted appearance before any view reads it so we don't
+        // flash the wrong mode on launch.
+        let storedAppearance = UserDefaults.standard.string(forKey: "cleanup.appearance")
+        self.appearancePreference = AppAppearance(rawValue: storedAppearance ?? "") ?? .dark
+
         restorePersistedState()
         refreshDeviceAndStorage()
         refreshPermissions()
         Task {
             await restoreGmailSessionIfPossible()
         }
+
+        // Register the photo-library change observer only if the user has
+        // already granted access. Registering while status is .notDetermined
+        // causes iOS to surface the permission prompt immediately on app
+        // launch, covering the splash. We defer registration until the
+        // onboarding "Allow Access" step actually grants access (see
+        // registerPhotoLibraryObserverIfNeeded).
+        if photoAuthorization.isReadable {
+            registerPhotoLibraryObserverIfNeeded()
+        }
+    }
+
+    /// Lazily installs the `PHPhotoLibraryChangeObserver`. Safe to call
+    /// multiple times — a second call is a no-op.
+    ///
+    /// Change-handling strategy:
+    ///   1. Coalesce bursts. iCloud deltas, edits, favorite toggles etc.
+    ///      often fire many callbacks in quick succession; we debounce
+    ///      with a short timer so a burst triggers at most one pass.
+    ///   2. Apply an **incremental** diff via
+    ///      `PHChange.changeDetails(for:)`. Only the inserted / removed
+    ///      / changed assets are processed — Vision, feature-print and
+    ///      face-count caches are preserved. That's the "no re-index
+    ///      mid-browse" fix: a new screenshot appears within a second
+    ///      or two without touching existing work.
+    ///   3. Fall back to a full scan only when iOS reports the change
+    ///      cannot be expressed incrementally, or when we have no
+    ///      cached fetch result yet.
+    private func registerPhotoLibraryObserverIfNeeded() {
+        guard photoLibraryObserver == nil else { return }
+        let bridge = PhotoLibraryChangeBridge { [weak self] change in
+            Task { @MainActor in
+                guard let self else { return }
+                self.schedulePhotoLibraryDelta(using: change)
+            }
+        }
+        PHPhotoLibrary.shared().register(bridge)
+        self.photoLibraryObserver = bridge
+    }
+
+    /// Debounces a flurry of `photoLibraryDidChange` callbacks. We
+    /// keep only the **latest** `PHChange` in the burst window — iOS's
+    /// snapshot always references the fetch result we stored, so the
+    /// freshest change is what we want to apply.
+    private func schedulePhotoLibraryDelta(using change: PHChange) {
+        photoLibraryChangeDebounce?.cancel()
+        let latestChange = change
+        let task = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 400_000_000) // 400ms burst window
+            guard !Task.isCancelled, let self else { return }
+            // If a scan is already running, keep the latest change
+            // around and drain it the moment the scan finishes. iOS
+            // does not re-send PHChanges, so dropping this would mean
+            // a mid-scan delete never gets applied as an incremental
+            // patch — we'd rely on the scan's pre-delete fetch snapshot,
+            // which is exactly what made Duplicates flash "0 / Zero KB"
+            // while `verifyDuplicatesByPixel` discarded the now-missing
+            // assets one at a time.
+            guard self.activeLibraryScanTask == nil else {
+                self.pendingLibraryChange = latestChange
+                return
+            }
+
+            let handled = await self.applyIncrementalPhotoLibraryChange(latestChange)
+            if !handled {
+                // Non-incremental change or no cache yet — iOS could
+                // not describe what changed as insert/remove/change
+                // arrays, so we have no choice but to rebuild.
+                // `.manual` because this is a real library change we
+                // must reflect (cooldown doesn't apply).
+                await self.scanLibrary(trigger: .manual)
+            }
+        }
+        photoLibraryChangeDebounce = task
     }
 
     var chargingPosters: [ChargingPoster] {
@@ -620,6 +854,19 @@ final class AppFlow: ObservableObject {
         gmailAccount != nil
     }
 
+    /// True once the user has successfully connected Gmail at least once on
+    /// this install. Used by EmailCleaner to decide whether to show the
+    /// demo "preview" data (new user, never connected) or a clean zero state
+    /// (previously connected, now disconnected — we should NOT re-show the
+    /// fake preview numbers or let them drill into old categories).
+    var hasEverConnectedGmail: Bool {
+        UserDefaults.standard.bool(forKey: "gmail.hasEverConnected")
+    }
+
+    private func markGmailEverConnected() {
+        UserDefaults.standard.set(true, forKey: "gmail.hasEverConnected")
+    }
+
     func bootstrapIfNeeded() async {
         guard mediaAssetsByCategory.isEmpty else {
             refreshDeviceAndStorage()
@@ -631,7 +878,10 @@ final class AppFlow: ObservableObject {
         refreshPermissions()
 
         if photoAuthorization.isReadable {
-            await scanLibrary()
+            // Already gated on `mediaAssetsByCategory.isEmpty` above,
+            // so this is effectively first-load. Pass the trigger
+            // explicitly to keep the central guard enforceable.
+            await scanLibrary(trigger: .firstLoad)
         } else {
             applyEmptyMediaState()
         }
@@ -645,12 +895,74 @@ final class AppFlow: ObservableObject {
         }
     }
 
+    /// Called when a feature hits the free-tier ceiling. Free users get the
+    /// "you've used your free X" gate sheet. Any paying tier is a no-op —
+    /// paying users shouldn't be nagged in-app, and plan changes are handled
+    /// entirely through Apple's Subscriptions UI.
+    ///
+    /// We key off `isPremium` (not `currentPlan`) so the debug force-free
+    /// toggle — which flips `isPremium` without clearing the underlying
+    /// Adapty plan — still routes the user through the paywall.
+    @MainActor
+    func requestUpgrade(for action: FreeAction) {
+        if EntitlementStore.shared.isPremium { return }
+        pendingUpgradeGate = UpgradeGateContext.forAction(action)
+    }
+
+    /// Gate helper for batch actions. Given the requested batch size, returns
+    /// the number of items the caller may actually process. Records the usage
+    /// and presents the upgrade sheet when the free limit has been reached or
+    /// exceeded. Returns 0 when the caller must stop.
+    @MainActor
+    func consumeFreeAllowance(_ action: FreeAction, requested: Int) -> Int {
+        let store = EntitlementStore.shared
+        if store.isPremium { return requested }
+        let used = store.usage[action] ?? 0
+        let remaining = max(0, action.limit - used)
+        if remaining == 0 {
+            requestUpgrade(for: action)
+            return 0
+        }
+        let allowed = min(remaining, requested)
+        store.recordUse(action, count: allowed)
+        if allowed < requested {
+            // Let the caller finish its allowed slice, then nudge the user.
+            requestUpgrade(for: action)
+        }
+        return allowed
+    }
+
+    /// Convenience for single-shot actions (compress, vault import, speaker).
+    /// Returns true when the action may proceed.
+    @MainActor
+    func gateSingleAction(_ action: FreeAction) -> Bool {
+        let store = EntitlementStore.shared
+        if store.isPremium { return true }
+        if store.canUse(action) {
+            store.recordUse(action)
+            return true
+        }
+        requestUpgrade(for: action)
+        return false
+    }
+
     func advanceOnboarding() {
         if onboardingIndex < OnboardingStep.allCases.count - 1 {
             onboardingIndex += 1
         } else {
-            stage = .paywall
+            // End of the 12-step onboarding — paywall is now step 10 inside
+            // the flow, so the final step drops straight into the app.
+            stage = .mainApp
         }
+    }
+
+    /// Called by `SplashView` when the splash animation finishes and
+    /// background preload is done. Transitions into the onboarding
+    /// flow (this is a first-launch product — there's no persisted
+    /// "onboarding completed" flag yet).
+    func finishSplash() {
+        guard stage == .splash else { return }
+        stage = .onboarding
     }
 
     func showPaywall() {
@@ -674,8 +986,26 @@ final class AppFlow: ObservableObject {
     }
 
     func refreshDeviceAndStorage() {
-        storageSnapshot = StorageSnapshot.current()
-        deviceSnapshot = DeviceSnapshot.current()
+        // Dispatch the synchronous disk I/O for volume capacity off the
+        // main thread so it can't block the first frame of whatever
+        // screen just triggered the refresh. `StorageSnapshot.current()`
+        // hits the file system via URLResourceValues; on a cold cache
+        // this can stall the main thread for hundreds of milliseconds,
+        // which was being perceived as the onboarding hero screen
+        // "lagging for the first 5 seconds" before animations settled.
+        //
+        // `DeviceSnapshot.current()` touches UIDevice (main-actor
+        // isolated) — we re-hop to the main actor for it, but only
+        // after the disk read has completed off-main, so the main
+        // thread stays free during the expensive part.
+        Task.detached(priority: .utility) { [weak self] in
+            let storage = StorageSnapshot.current()
+            await MainActor.run {
+                guard let self else { return }
+                self.storageSnapshot = storage
+                self.deviceSnapshot = DeviceSnapshot.current()
+            }
+        }
     }
 
     func refreshPermissions() {
@@ -760,6 +1090,7 @@ final class AppFlow: ObservableObject {
         gmailSenderSummaries = snapshot.senders
         gmailLastSyncedAt = snapshot.syncedAt
         gmailErrorMessage = nil
+        markGmailEverConnected()
     }
 
     private func clearGmailState() {
@@ -814,33 +1145,136 @@ final class AppFlow: ObservableObject {
 
     func isRefiningClusters(for category: DashboardCategoryKind) -> Bool {
         refiningClusterCategories.contains(category)
+            || pendingRefinementCategories.contains(category)
     }
 
-    func refineReviewClustersIfNeeded(for category: DashboardCategoryKind) async {
-        guard [.similar, .similarScreenshots, .similarVideos, .screenshots].contains(category) else { return }
-        guard photoAuthorization.isReadable else { return }
-        guard !refiningClusterCategories.contains(category) else { return }
+    /// The ONLY writer for `mediaClustersByCategory[.duplicates]`.
+    ///
+    /// Candidate buckets from the scan group photos by (mediaType,
+    /// resolution) — which on an iPhone library collapses thousands
+    /// of unrelated photos together. This function opens each
+    /// candidate, computes a pixel fingerprint (SHA256 over a
+    /// quantized 64×64 grayscale render), and rebuckets by that
+    /// fingerprint. Two photos end up in the same duplicate cluster
+    /// iff their actual pixel content matches.
+    ///
+    /// A single-member candidate bucket is trivially not a duplicate
+    /// and is skipped entirely — no fingerprint computed. This is
+    /// what keeps the pass fast: only photos that share dimensions
+    /// with at least one other photo pay the fingerprint cost.
+    ///
+    /// Writes directly to `mediaClustersByCategory[.duplicates]` on
+    /// the main actor. The dashboard card shows 0 until this
+    /// finishes, then jumps to the correct number. No intermediate
+    /// "refining then correcting" flicker.
+    func verifyDuplicatesByPixel(candidateBuckets: [String: [MediaAssetRecord]]) async {
+        refiningClusterCategories.insert(.duplicates)
+        defer { refiningClusterCategories.remove(.duplicates) }
 
-        let sourceClusters = mediaClusters(for: category)
-        let expectedSignature = refinementSourceSignature(for: sourceClusters)
-        guard clusterRefinementSignature[category] != expectedSignature else { return }
-        guard !sourceClusters.isEmpty else {
-            clusterRefinementSignature[category] = expectedSignature
+        // Only care about candidate buckets with ≥2 members.
+        let interesting = candidateBuckets.values.filter { $0.count > 1 }
+        guard !interesting.isEmpty else {
+            mediaClustersByCategory[.duplicates] = []
+            mediaAssetsByCategory[.duplicates] = []
+            refreshDashboardCategories()
             return
         }
 
-        refiningClusterCategories.insert(category)
-        defer { refiningClusterCategories.remove(category) }
+        var verifiedClusters: [MediaCluster] = []
 
-        let refinedClusters = await refineVisualClusters(from: sourceClusters, category: category)
-        guard expectedSignature == refinementSourceSignature(for: mediaClusters(for: category)) else { return }
+        // Process each candidate bucket independently. Within a
+        // bucket we fingerprint members, then group by print.
+        //
+        // CONCURRENCY CAP. Previously every candidate in the bucket
+        // spawned its own task simultaneously — on large buckets
+        // (thousands of photos at same resolution) that meant
+        // thousands of parallel `requestIndexingThumbnail` calls all
+        // hitting `photoanalysisd`. iOS's Photos daemon is
+        // single-threaded internally, so the flood queued up and
+        // STARVED the UI's own thumbnail requests (why users saw
+        // blank grey tiles on every cluster card until refinement
+        // finished).
+        //
+        // We now cap in-flight fingerprints at 4. The Photos daemon
+        // still gets work to do, the verifier still makes steady
+        // progress, and the app's visible thumbnails get scheduled
+        // ahead because they run at higher QoS (`.userInitiated` in
+        // `MediaWorkQueues.thumbnailQueue`) while this loop runs at
+        // `.utility` inside `pixelFingerprint`.
+        let maxConcurrentFingerprints = 4
+        for (candidateIndex, candidates) in interesting.enumerated() {
+            let fingerprints: [(MediaAssetRecord, Data?)] = await withTaskGroup(of: (MediaAssetRecord, Data?).self) { group in
+                var inFlight = 0
+                var cursor = 0
+                var results: [(MediaAssetRecord, Data?)] = []
+                results.reserveCapacity(candidates.count)
 
-        clusterRefinementSignature[category] = expectedSignature
+                func spawnNext() {
+                    guard cursor < candidates.count else { return }
+                    let record = candidates[cursor]
+                    cursor += 1
+                    inFlight += 1
+                    group.addTask { [weak self] in
+                        guard let self else { return (record, nil) }
+                        let print = await self.pixelFingerprint(for: record)
+                        return (record, print)
+                    }
+                }
+                // Prime the pipe with up to `maxConcurrentFingerprints`
+                // tasks.
+                for _ in 0..<min(maxConcurrentFingerprints, candidates.count) {
+                    spawnNext()
+                }
+                while inFlight > 0 {
+                    if let entry = await group.next() {
+                        results.append(entry)
+                        inFlight -= 1
+                        // Start the next one to keep the pipe at depth N.
+                        spawnNext()
+                    } else {
+                        break
+                    }
+                }
+                return results
+            }
 
-        let finalClusters = refinedClusters.isEmpty ? sourceClusters : refinedClusters
-        assertUniqueClusterMembership(in: finalClusters, category: category)
-        mediaClustersByCategory[category] = finalClusters
-        mediaAssetsByCategory[category] = flattenClusters(finalClusters).sorted {
+            // Group by fingerprint. Assets whose fingerprint couldn't
+            // be computed are dropped (we'd rather skip than misgroup).
+            var byPrint: [Data: [MediaAssetRecord]] = [:]
+            for (record, print) in fingerprints {
+                guard let print else { continue }
+                byPrint[print, default: []].append(record)
+            }
+
+            for (printIndex, (_, records)) in byPrint.enumerated() where records.count > 1 {
+                let sorted = records.sorted {
+                    if $0.sizeInBytes == $1.sizeInBytes {
+                        return ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast)
+                    }
+                    return $0.sizeInBytes > $1.sizeInBytes
+                }
+                verifiedClusters.append(
+                    MediaCluster(
+                        id: "duplicates-\(candidateIndex)-\(printIndex)",
+                        category: .duplicates,
+                        assets: sorted,
+                        totalBytes: sorted.reduce(0) { $0 + $1.sizeInBytes },
+                        subtitle: nil
+                    )
+                )
+            }
+
+            // Yield between candidate buckets so the UI stays responsive.
+            await Task.yield()
+        }
+
+        verifiedClusters.sort {
+            if $0.totalBytes == $1.totalBytes { return $0.count > $1.count }
+            return $0.totalBytes > $1.totalBytes
+        }
+
+        mediaClustersByCategory[.duplicates] = verifiedClusters
+        mediaAssetsByCategory[.duplicates] = verifiedClusters.flatMap(\.assets).sorted {
             if $0.sizeInBytes == $1.sizeInBytes {
                 return ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast)
             }
@@ -849,17 +1283,53 @@ final class AppFlow: ObservableObject {
         refreshDashboardCategories()
     }
 
+    func refineReviewClustersIfNeeded(for category: DashboardCategoryKind) async {
+        // Refinement is OFF for every category right now. Reasoning:
+        //
+        //   .duplicates            → initial bucket key already uses
+        //                            exact file size in bytes, so
+        //                            duplicate detection is pixel-
+        //                            accurate without refinement.
+        //   .similar               → scan-time visual-hash bucketing
+        //                            already produces good clusters.
+        //                            Refinement added a slow second
+        //                            Vision-feature-print pass per
+        //                            asset for no visible improvement.
+        //   .similarScreenshots    → same as .similar.
+        //   .similarVideos         → same as .similar.
+        //   .screenshots           → the UI renders this as a FLAT
+        //                            gallery (see
+        //                            usesFlatScreenshotGallery in
+        //                            DashboardView) — cluster output
+        //                            isn't displayed at all, so
+        //                            refining burned CPU for nothing.
+        //
+        // The refinement pipeline (`refineVisualClusters`,
+        // `refinedSubclusters`, signature cache, etc.) is still in
+        // the file — if a specific category starts showing bad
+        // clusters later, flip that category back on here and it'll
+        // work again without needing to re-plumb anything.
+        _ = category
+    }
+
     func requestPhotoAccessIfNeeded() async -> Bool {
         refreshPermissions()
         if photoAuthorization.isReadable {
-            await scanLibrary()
+            registerPhotoLibraryObserverIfNeeded()
+            // Permission was already granted — if we haven't scanned
+            // yet this is truly first-load; if we have, `.firstLoad`
+            // will no-op and reuse cached results.
+            await scanLibrary(trigger: .firstLoad)
             return true
         }
 
         let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         photoAuthorization = status
         if status.isReadable {
-            await scanLibrary()
+            registerPhotoLibraryObserverIfNeeded()
+            // User just granted permission — always do a fresh scan
+            // because there's no way the cache can be right.
+            await scanLibrary(trigger: .manual)
             return true
         }
 
@@ -870,17 +1340,28 @@ final class AppFlow: ObservableObject {
     func requestPhotoAuthorizationOnly() async -> Bool {
         refreshPermissions()
         if photoAuthorization.isReadable {
+            registerPhotoLibraryObserverIfNeeded()
             return true
         }
 
         let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         photoAuthorization = status
         if status.isReadable {
+            registerPhotoLibraryObserverIfNeeded()
             return true
         }
 
         applyEmptyMediaState()
         return false
+    }
+
+    /// Opens iOS Settings on this app's page. Called from permission CTAs
+    /// when the user previously denied access and iOS no longer allows us
+    /// to show the system prompt — the only remaining remediation is for
+    /// the user to flip the toggle in Settings themselves.
+    func openSystemSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
     }
 
     func requestContactsAccessIfNeeded() async -> Bool {
@@ -934,7 +1415,91 @@ final class AppFlow: ObservableObject {
         return false
     }
 
-    func scanLibrary() async {
+    /// True when callers like Smart Clean should trigger a scan instead
+    /// of re-using what the dashboard already produced. We say yes only
+    /// if we genuinely have no results yet OR they're past the auto-
+    /// rescan cooldown. Entering Smart Clean seconds after the
+    /// dashboard finished a full scan now reuses that result rather
+    /// than spinning the whole Vision pipeline a second time.
+    func shouldRescanForSmartClean() -> Bool {
+        guard photoAuthorization.isReadable else { return false }
+        if isScanningLibrary { return false }
+        guard let last = lastLibraryScanAt else { return true }
+        return Date().timeIntervalSince(last) >= autoRescanCooldown
+    }
+
+    /// Read-only handle to the in-flight library scan, if any. Lets
+    /// Smart Clean await the dashboard's scan without starting its own.
+    var activeLibraryScanAwaitable: Task<Void, Never>? { activeLibraryScanTask }
+
+    /// Where a rescan request is coming from. Every caller of
+    /// `scanLibrary(trigger:)` must pick one of these so the rule
+    /// about whether to actually run lives in ONE place — not scattered
+    /// across every `.task`, `.onReceive`, pull-to-refresh handler, and
+    /// tab-change observer. Past bugs in this file have all been
+    /// variations of "something accidentally wired a full rescan to a
+    /// foreground notification"; this enum lets us block that at the
+    /// source.
+    enum ScanTrigger {
+        /// User explicitly asked for fresh data: pulled to refresh,
+        /// tapped the top-right refresh button, tapped a permission
+        /// card. These ALWAYS run, even during refinement — the user
+        /// is in control.
+        case manual
+        /// We've never scanned before (fresh install, permission just
+        /// granted, onboarding finished). Runs if and only if we
+        /// genuinely have no cached scan yet.
+        case firstLoad
+        /// Reactive trigger: app foregrounded, a view's `.task`
+        /// fired, tab was re-entered, a sheet dismissed. These are
+        /// the dangerous callers. Runs only if BOTH:
+        ///   (a) we're past the auto-rescan cooldown, AND
+        ///   (b) no refinement is currently in progress (we do NOT
+        ///       stomp on an active pixel-fingerprint pass just
+        ///       because the app foregrounded).
+        case auto
+    }
+
+    /// Single source of truth for "should this rescan actually run?"
+    /// Returns a short reason string when it declines, for logging.
+    private func scanShouldProceed(for trigger: ScanTrigger) -> (ok: Bool, reason: String) {
+        switch trigger {
+        case .manual:
+            return (true, "manual")
+        case .firstLoad:
+            if lastLibraryScanAt == nil { return (true, "first-load") }
+            return (false, "first-load skipped: already scanned at least once")
+        case .auto:
+            if !refiningClusterCategories.isEmpty {
+                return (false, "auto skipped: refinement in progress for \(refiningClusterCategories)")
+            }
+            if !pendingRefinementCategories.isEmpty {
+                return (false, "auto skipped: refinement pending for \(pendingRefinementCategories)")
+            }
+            if let last = lastLibraryScanAt,
+               Date().timeIntervalSince(last) < autoRescanCooldown {
+                return (false, "auto skipped: within cooldown (\(Int(Date().timeIntervalSince(last)))s < \(Int(autoRescanCooldown))s)")
+            }
+            return (true, "auto")
+        }
+    }
+
+    func scanLibrary(trigger: ScanTrigger = .manual) async {
+        let decision = scanShouldProceed(for: trigger)
+        guard decision.ok else {
+            // Keep this as a print rather than a logger call so it
+            // shows up in the Xcode console during development without
+            // needing a category filter.
+            print("[scanLibrary] \(decision.reason)")
+            // If a scan is already running and a caller asked for
+            // `.manual` or `.auto`, still await it so the caller sees
+            // fresh data when this returns.
+            if let activeLibraryScanTask {
+                await activeLibraryScanTask.value
+            }
+            return
+        }
+
         if let activeLibraryScanTask {
             await activeLibraryScanTask.value
             return
@@ -946,9 +1511,51 @@ final class AppFlow: ObservableObject {
         activeLibraryScanTask = scanTask
         await scanTask.value
         activeLibraryScanTask = nil
+        lastLibraryScanAt = Date()
+
+        // Drain any `PHChange` that arrived while the scan was running.
+        // The scan's fetch result was captured at its start, so it still
+        // contains the pre-change assets; `changeDetails(for:)` can tell
+        // us what needs to be stripped/inserted. Apply it surgically so
+        // Duplicates doesn't flash to 0 waiting on a full rebuild.
+        if let queuedChange = pendingLibraryChange {
+            pendingLibraryChange = nil
+            let handled = await applyIncrementalPhotoLibraryChange(queuedChange)
+            if !handled {
+                // iOS couldn't describe it incrementally — fall back to
+                // a fresh scan so we don't ship stale data. Guard
+                // against unbounded recursion: clear the queue first so
+                // the next scan's drain is a no-op.
+                await scanLibrary(trigger: .manual)
+            }
+        }
+
+        // Push fresh battery / storage / scan state into the App Group so
+        // the Home-Screen widgets can reload with real numbers instead of
+        // whatever they last saw.
+        SharedSnapshotWriter.shared.refresh(force: true)
+    }
+
+    /// Legacy shim. Prefer `scanLibrary(trigger:)` — passing an
+    /// explicit trigger makes the call site's intent auditable.
+    /// This wrapper treats a bare call as `.manual` to preserve
+    /// existing behavior for user-initiated paths.
+    func scanLibrary() async {
+        await scanLibrary(trigger: .manual)
+    }
+
+    /// Used by auto-triggers (didBecomeActive, tab re-entry, etc). Skips
+    /// the rescan if we already have fresh results — prevents the preview
+    /// sheet from wiping Vision caches every time the user backgrounds
+    /// and reopens the app. Now just a thin wrapper over the
+    /// `.auto` trigger, which does the same job centrally.
+    func scanLibraryIfStale() async {
+        await scanLibrary(trigger: .auto)
     }
 
     private func performLibraryScan() async {
+        let scanStart = Date()
+        print("[SCAN] T+0.00s — performLibraryScan BEGIN")
         libraryScanGeneration += 1
         let scanGeneration = libraryScanGeneration
         clusterRefinementSignature.removeAll()
@@ -956,9 +1563,14 @@ final class AppFlow: ObservableObject {
         visualSignatureCache.removeAll()
         semanticFeaturePrintCache.removeAll()
         faceCountCache.removeAll()
+        faceEmbeddingsCache.removeAll()
+        pixelFingerprintCache.removeAll()
+        confirmedScreenRecordingIDs.removeAll()
 
         refreshDeviceAndStorage()
         refreshPermissions()
+        print(String(format: "[SCAN] T+%.2fs — after refreshDeviceAndStorage + refreshPermissions",
+              Date().timeIntervalSince(scanStart)))
 
         guard photoAuthorization.isReadable else {
             applyEmptyMediaState()
@@ -970,14 +1582,67 @@ final class AppFlow: ObservableObject {
         scanStatusText = "Scanning your library..."
         scannedLibraryItems = 0
 
+        let fetchStart = Date()
         let fetchOptions = PHFetchOptions()
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         let fetchResult = PHAsset.fetchAssets(with: fetchOptions)
         PhotoAssetLookup.shared.reset()
+        print(String(format: "[SCAN] T+%.2fs — PHAsset.fetchAssets took %.3fs, count=%d",
+              Date().timeIntervalSince(scanStart),
+              Date().timeIntervalSince(fetchStart),
+              fetchResult.count))
 
         totalLibraryItems = fetchResult.count
         photoCount = 0
         videoCount = 0
+
+        // Pre-materialize the PHAsset array once on MainActor so the
+        // concurrent preflight below can iterate it without calling
+        // `fetchResult.object(at:)` from background tasks (Photos' fetch
+        // result is optimised for the thread it was created on).
+        let materializeStart = Date()
+        var materializedAssets: [PHAsset] = []
+        materializedAssets.reserveCapacity(fetchResult.count)
+        fetchResult.enumerateObjects { asset, _, _ in
+            materializedAssets.append(asset)
+        }
+        print(String(format: "[SCAN] T+%.2fs — enumerateObjects took %.3fs",
+              Date().timeIntervalSince(scanStart),
+              Date().timeIntervalSince(materializeStart)))
+
+        // Preflight runs in parallel with the routing loop below, not
+        // BEFORE it. The old "await the full preflight, then start
+        // routing" version stalled the progress counter at "0 of N"
+        // for 2+ minutes on large libraries — the scan was working
+        // internally but had nothing to publish yet. Running it in
+        // parallel lets the routing loop start routing immediately;
+        // the preflight fills the cache from behind so the majority
+        // of `estimatedFileSize` calls become instant cache hits
+        // within the first few seconds.
+        //
+        // Preflight fans out across 8 workers AT FULL SPEED. We used
+        // to throttle it to 1 worker to protect the paywall's WebView,
+        // but the scan is no longer kicked off during the paywall
+        // step (see `OnboardingFlowView.kickOffFirstScanIfNeeded`) —
+        // by the time this runs the paywall is gone and the WebView
+        // is dead, so there's nothing to protect and no reason not to
+        // use the full available concurrency.
+        //
+        // Results merge to the MainActor caches in chunks as each
+        // worker chunk finishes (not all at the end), so even a
+        // partially-completed preflight benefits the routing loop.
+        // No preflight, no separate classifier workers. The old code
+        // spun up TWO extra background fleets (8 preflight workers
+        // reading PHAssetResource.fileSize, plus 8 classifier workers
+        // reading PHAssetResource.originalFilename) that flooded
+        // `photoanalysisd` and starved the UI's thumbnail requests
+        // — that's why thumbnails were invisible for 2-3 minutes
+        // during scan. The preread streaming pass already reads each
+        // asset once; we fold the screen-recording filename check
+        // into it. Real file sizes are computed on-demand via
+        // `preciseFileSize` only when the user opens a cluster to
+        // make a delete decision — that's the only place byte-exact
+        // numbers matter.
 
         var categorized: [DashboardCategoryKind: [MediaAssetRecord]] = Dictionary(
             uniqueKeysWithValues: DashboardCategoryKind.allCases.map { ($0, []) }
@@ -986,87 +1651,143 @@ final class AppFlow: ObservableObject {
         var similarBuckets: [String: [MediaAssetRecord]] = [:]
         var similarVideoBuckets: [String: [MediaAssetRecord]] = [:]
         var similarScreenshotBuckets: [String: [MediaAssetRecord]] = [:]
+        var assetRouting: [String: AssetRouting] = [:]
         var analysisBatch: [MediaAssetRecord] = []
 
         let total = max(fetchResult.count, 1)
-        var lastSnapshotPublishAt = Date.distantPast
+        var lastSnapshotPublishedAt: Int = 0
+        let routingLoopStart = Date()
+        var loggedMilestones = Set<Int>()
+        print(String(format: "[SCAN] T+%.2fs — routing loop START",
+              Date().timeIntervalSince(scanStart)))
 
-        for index in 0..<fetchResult.count {
-            guard scanGeneration == libraryScanGeneration else { return }
+        // STREAMING PRE-READ. The preread reads every PHAsset property
+        // off MainActor (pixelWidth, mediaSubtypes, creationDate, etc.)
+        // so the routing loop doesn't pay the lazy-load cost. Instead
+        // of waiting for all 37K to finish preread (which was causing
+        // the 2-minute "Scanning 0 of X" stall), we stream chunks of
+        // 500 back to MainActor as each chunk completes. The routing
+        // loop consumes each chunk as soon as it arrives — users see
+        // "Scanning 500 of 37,750" within a second, not 2 minutes.
+        let assetsCopy = materializedAssets
+        let expectedGeneration = scanGeneration
+        let chunkStream = AsyncStream<[AssetMetaSnapshot]> { continuation in
+            // `.utility` priority (not `.userInitiated`) so that when
+            // the user navigates to a cluster view, their thumbnail
+            // load requests (which run at `.userInitiated` via
+            // `MediaWorkQueues.thumbnailQueue`) win the Photos-daemon
+            // scheduling race. The scan still makes steady progress
+            // but doesn't starve thumbnails.
+            Task.detached(priority: .utility) {
+                Self.prereadAssetMetadataStreaming(
+                    assetsCopy,
+                    chunkSize: 300
+                ) { chunk in
+                    continuation.yield(chunk)
+                }
+                continuation.finish()
+            }
+        }
 
-            let asset = fetchResult.object(at: index)
-            PhotoAssetLookup.shared.upsert(asset)
-            let record = makeMediaRecord(from: asset)
-            analysisBatch.append(record)
+        var processedSoFar = 0
+        for await chunk in chunkStream {
+            guard scanGeneration == expectedGeneration else { return }
 
-            if asset.mediaType == .image {
-                photoCount += 1
-            } else if asset.mediaType == .video {
-                videoCount += 1
+            for meta in chunk {
+                processedSoFar += 1
+                let assetIndex = processedSoFar - 1
+                let asset = materializedAssets[assetIndex]
+                PhotoAssetLookup.shared.upsert(asset)
+
+                let (record, routing) = self.routeFromMeta(
+                    meta: meta,
+                    categorized: &categorized,
+                    duplicateBuckets: &duplicateBuckets,
+                    similarBuckets: &similarBuckets,
+                    similarVideoBuckets: &similarVideoBuckets,
+                    similarScreenshotBuckets: &similarScreenshotBuckets
+                )
+                assetRouting[record.id] = routing
+                analysisBatch.append(record)
+                if meta.mediaType == .image { photoCount += 1 }
+                else if meta.mediaType == .video { videoCount += 1 }
             }
 
-            if record.mediaType == .video {
-                let videoKey = similarVideoKey(for: asset, size: record.sizeInBytes)
-                similarVideoBuckets[videoKey, default: []].append(record)
-                // Stash preliminary bucket. `applyLibrarySnapshot` will
-                // re-route to exactly one of: similarVideos, screenRecordings,
-                // shortRecordings, videos using priority rules.
-                if isScreenRecordingAsset(asset) {
-                    categorized[.screenRecordings, default: []].append(record)
-                } else if asset.duration > 0, asset.duration < 10 {
-                    categorized[.shortRecordings, default: []].append(record)
-                } else {
-                    categorized[.videos, default: []].append(record)
-                }
-            } else {
-                categorized[.other, default: []].append(record)
-
-                if record.isScreenshot {
-                    categorized[.screenshots, default: []].append(record)
-                    let screenshotKey = similarScreenshotKey(for: asset)
-                    similarScreenshotBuckets[screenshotKey, default: []].append(record)
-                } else {
-                    let duplicateKey = exactDuplicateKey(for: asset, size: record.sizeInBytes)
-                    duplicateBuckets[duplicateKey, default: []].append(record)
-
-                    let similarKey = similarPhotoKey(for: asset)
-                    similarBuckets[similarKey, default: []].append(record)
+            // After each chunk: update progress, maybe snapshot.
+            let processedCount = processedSoFar
+            for milestone in [1000, 5000, 10000, 20000, 30000] {
+                if processedCount >= milestone, !loggedMilestones.contains(milestone) {
+                    loggedMilestones.insert(milestone)
+                    let elapsed = Date().timeIntervalSince(routingLoopStart)
+                    let rate = Double(processedCount) / max(elapsed, 0.001)
+                    print(String(format: "[SCAN] T+%.2fs — routing loop: %d items in %.2fs (%.0f items/sec)",
+                          Date().timeIntervalSince(scanStart),
+                          processedCount, elapsed, rate))
                 }
             }
 
-            let processedCount = index + 1
+            let isFinalItem = processedCount == assetsCopy.count
+            scanProgress = CGFloat(processedCount) / CGFloat(total)
+            scanStatusText = libraryScanStatusText(processedCount: processedCount, totalCount: assetsCopy.count)
+            scannedLibraryItems = processedCount
+            await Task.yield()
 
-            let isFinalItem = index == fetchResult.count - 1
-            if index.isMultiple(of: 200) || isFinalItem {
-                scanProgress = CGFloat(processedCount) / CGFloat(total)
-                scanStatusText = libraryScanStatusText(processedCount: processedCount, totalCount: fetchResult.count)
-                scannedLibraryItems = processedCount
-
-                let shouldPublishSnapshot = isFinalItem
-                    || index.isMultiple(of: librarySnapshotBatchSize)
-                    || Date().timeIntervalSince(lastSnapshotPublishAt) >= 2.0
-                if shouldPublishSnapshot {
-                    await applyLibrarySnapshot(
-                        categorized: categorized,
-                        duplicateBuckets: duplicateBuckets,
-                        similarBuckets: similarBuckets,
-                        similarVideoBuckets: similarVideoBuckets,
-                        similarScreenshotBuckets: similarScreenshotBuckets
-                    )
-                    lastSnapshotPublishAt = Date()
-                }
-                await Task.yield()
+            let shouldPublishSnapshot: Bool = {
+                if isFinalItem { return true }
+                if total < 1000 { return false }
+                let fraction = Double(processedCount) / Double(total)
+                let milestones: [Double] = [0.10, 0.25, 0.50, 0.75]
+                let hitMilestone = milestones.contains(where: { m in
+                    fraction >= m && (Double(processedCount - chunk.count) / Double(total)) < m
+                })
+                if hitMilestone { return true }
+                let gap = processedCount - lastSnapshotPublishedAt
+                if gap >= 3000 { return true }
+                return false
+            }()
+            if shouldPublishSnapshot {
+                let snapStart = Date()
+                await applyLibrarySnapshot(
+                    categorized: categorized,
+                    duplicateBuckets: duplicateBuckets,
+                    similarBuckets: similarBuckets,
+                    similarVideoBuckets: similarVideoBuckets,
+                    similarScreenshotBuckets: similarScreenshotBuckets
+                )
+                let snapElapsed = Date().timeIntervalSince(snapStart)
+                print(String(format: "[SCAN] T+%.2fs — applyLibrarySnapshot @%d took %.3fs",
+                      Date().timeIntervalSince(scanStart),
+                      processedCount, snapElapsed))
+                lastSnapshotPublishedAt = processedCount
             }
 
-            if processedCount.isMultiple(of: librarySnapshotBatchSize), processedCount < fetchResult.count {
+            if processedCount.isMultiple(of: librarySnapshotBatchSize),
+               processedCount < assetsCopy.count,
+               !analysisBatch.isEmpty {
                 await mediaAnalysisStore.upsertMetadataBatch(analysisBatch)
                 analysisBatch.removeAll(keepingCapacity: true)
             }
         }
         guard scanGeneration == libraryScanGeneration else { return }
 
-        await mediaAnalysisStore.upsertMetadataBatch(analysisBatch)
+        print(String(format: "[SCAN] T+%.2fs — routing loop COMPLETE (%d items, %.2fs, %.0f items/sec)",
+              Date().timeIntervalSince(scanStart),
+              materializedAssets.count,
+              Date().timeIntervalSince(routingLoopStart),
+              Double(materializedAssets.count) / max(Date().timeIntervalSince(routingLoopStart), 0.001)))
 
+        // Screen-recording classifier is fire-and-forget from the top
+        // of this function — it runs in parallel with the routing
+        // loop and promotes matching records into `.screenRecordings`
+        // as soon as each chunk lands. No blocking pass here.
+
+        let finalBatchStart = Date()
+        await mediaAnalysisStore.upsertMetadataBatch(analysisBatch)
+        print(String(format: "[SCAN] T+%.2fs — final upsertMetadataBatch took %.3fs",
+              Date().timeIntervalSince(scanStart),
+              Date().timeIntervalSince(finalBatchStart)))
+
+        let finalSnapshotStart = Date()
         await applyLibrarySnapshot(
             categorized: categorized,
             duplicateBuckets: duplicateBuckets,
@@ -1074,11 +1795,620 @@ final class AppFlow: ObservableObject {
             similarVideoBuckets: similarVideoBuckets,
             similarScreenshotBuckets: similarScreenshotBuckets
         )
+        print(String(format: "[SCAN] T+%.2fs — final applyLibrarySnapshot took %.3fs",
+              Date().timeIntervalSince(scanStart),
+              Date().timeIntervalSince(finalSnapshotStart)))
+        print(String(format: "[SCAN] T+%.2fs — ✅ SCAN DONE (routing phase)",
+              Date().timeIntervalSince(scanStart)))
+
+        // Cache the fetch result and the bucket state so a
+        // `PHPhotoLibraryChangeObserver` can ask iOS for a precise
+        // diff and patch these buckets in place instead of forcing a
+        // full re-index on every screenshot.
+        lastLibraryFetchResult = fetchResult
+        lastLibraryBuckets = LibraryBucketsCache(
+            categorized: categorized,
+            duplicateBuckets: duplicateBuckets,
+            similarBuckets: similarBuckets,
+            similarVideoBuckets: similarVideoBuckets,
+            similarScreenshotBuckets: similarScreenshotBuckets,
+            assetRouting: assetRouting
+        )
 
         scanProgress = fetchResult.count == 0 ? 0 : 1
         scanStatusText = fetchResult.count == 0 ? "No media found yet" : "Scan complete"
         scannedLibraryItems = fetchResult.count
         isScanningLibrary = false
+
+        // Duplicates are NOT populated during the scan itself — the
+        // raw `duplicateBuckets` are just "same pixel dimensions"
+        // candidate groups, which produces enormous false positives
+        // on an iPhone library where thousands of photos share
+        // resolution. The pixel-fingerprint verifier below is the
+        // sole source of truth for `.duplicates`: it actually opens
+        // each candidate, computes a SHA256 over a quantized pixel
+        // render, and only groups photos whose pixels match.
+        //
+        // Similar / screenshots / videos used to go through a second
+        // Vision-feature-print refinement pass. That's been disabled —
+        // the scan-time visual-hash bucketing is good enough for those
+        // categories, and refinement was what made the dashboard feel
+        // laggy after a scan. See `refineReviewClustersIfNeeded` for
+        // the full rationale per category.
+        //
+        // Only `.duplicates` still has a post-scan pass: pixel
+        // fingerprinting via `verifyDuplicatesByPixel`, which is what
+        // fixes the "90 GB of duplicates" bug by requiring bit-exact
+        // pixel matches instead of just same-file-size grouping.
+        if fetchResult.count > 0 {
+            pendingRefinementCategories = [.duplicates]
+            Task { @MainActor [weak self] in
+                await self?.verifyDuplicatesByPixel(candidateBuckets: duplicateBuckets)
+                self?.pendingRefinementCategories.remove(.duplicates)
+            }
+        }
+    }
+
+    /// Routes one asset into the bucket dicts using the same priority
+    /// rules `applyLibrarySnapshot` expects. Returns an `AssetRouting`
+    /// record so a later incremental remove can strip the asset from
+    /// exactly the buckets it was placed in, in O(1).
+    ///
+    /// Kept as a single function so full-scan and incremental-insert
+    /// paths are guaranteed to produce identical results.
+    /// Plain value-type snapshot of the PHAsset properties the
+    /// routing loop needs. Once we preread these off MainActor we
+    /// never touch the PHAsset object again during routing — so no
+    /// lazy Photos-DB round-trips happen on the main thread.
+    struct AssetMetaSnapshot: Sendable {
+        let id: String
+        let mediaType: PHAssetMediaType
+        let mediaSubtypes: PHAssetMediaSubtype
+        let pixelWidth: Int
+        let pixelHeight: Int
+        let duration: TimeInterval
+        let creationDate: Date?
+        let modificationDate: Date?
+        /// Pre-computed screen-recording flag: true when the asset is
+        /// a portrait-oriented video whose original filename starts
+        /// with `rpreplay`, `screen recording`, or `screenrecording`.
+        /// This is computed in the preread pass (one PHAssetResource
+        /// call per candidate) rather than in a separate flood, so
+        /// we don't hammer `photoanalysisd` with concurrent workers.
+        let isScreenRecording: Bool
+    }
+
+    /// Pre-reads every PHAsset's metadata in parallel chunks off
+    /// MainActor. Returns an array parallel to the input so index i
+    /// of the output maps to index i of `assets`.
+    ///
+    /// This is the key speed fix. Before: routing loop on MainActor
+    /// reads `.pixelWidth`, `.mediaSubtypes`, `.creationDate` etc.
+    /// inside the hot loop — each read can be a synchronous Photos
+    /// XPC round-trip that stalls the loop. After: all reads happen
+    /// once here in parallel on background threads, the loop then
+    /// iterates plain Swift structs at memory speed.
+    /// Streaming version of `prereadAssetMetadata`. Reads PHAsset
+    /// properties sequentially (single-threaded — Photos DB is
+    /// serialized internally anyway, so parallel workers just queue
+    /// behind each other) and emits chunks of `chunkSize` snapshots
+    /// as they become available. This lets the routing loop start
+    /// consuming within ~100ms of scan start, instead of waiting for
+    /// the full preread.
+    nonisolated private static func prereadAssetMetadataStreaming(
+        _ assets: [PHAsset],
+        chunkSize: Int,
+        onChunk: (([AssetMetaSnapshot]) -> Void)
+    ) {
+        guard !assets.isEmpty else { return }
+        var buffer: [AssetMetaSnapshot] = []
+        buffer.reserveCapacity(chunkSize)
+        for asset in assets {
+            // Screen-recording check: only for portrait videos. We
+            // read `PHAssetResource.originalFilename` inline here —
+            // yes it costs one PHAssetResource call per candidate
+            // video, but we do it serially in this one pass instead
+            // of spawning 8 parallel workers that would flood
+            // `photoanalysisd` and break the UI's thumbnail requests.
+            var isScreenRecording = false
+            if asset.mediaType == .video && asset.pixelHeight >= asset.pixelWidth {
+                let resources = PHAssetResource.assetResources(for: asset)
+                if let filename = resources.first?.originalFilename {
+                    let lower = filename.lowercased()
+                    isScreenRecording = lower.hasPrefix("rpreplay")
+                        || lower.hasPrefix("screen recording")
+                        || lower.hasPrefix("screenrecording")
+                }
+            }
+            let snap = AssetMetaSnapshot(
+                id: asset.localIdentifier,
+                mediaType: asset.mediaType,
+                mediaSubtypes: asset.mediaSubtypes,
+                pixelWidth: asset.pixelWidth,
+                pixelHeight: asset.pixelHeight,
+                duration: asset.duration,
+                creationDate: asset.creationDate,
+                modificationDate: asset.modificationDate,
+                isScreenRecording: isScreenRecording
+            )
+            buffer.append(snap)
+            if buffer.count >= chunkSize {
+                onChunk(buffer)
+                buffer.removeAll(keepingCapacity: true)
+            }
+        }
+        if !buffer.isEmpty {
+            onChunk(buffer)
+        }
+    }
+
+    nonisolated private static func prereadAssetMetadata(
+        _ assets: [PHAsset]
+    ) -> [AssetMetaSnapshot] {
+        guard !assets.isEmpty else { return [] }
+        var result = [AssetMetaSnapshot?](repeating: nil, count: assets.count)
+        let workerCount = min(8, max(1, ProcessInfo.processInfo.activeProcessorCount))
+        let chunkSize = max(1, (assets.count + workerCount - 1) / workerCount)
+
+        // Concurrent dispatch; each worker writes into a disjoint
+        // slice of the result buffer so no locking needed.
+        let queue = DispatchQueue.global(qos: .userInitiated)
+        let group = DispatchGroup()
+
+        // We can't safely write to a non-Sendable Array from multiple
+        // queues without a lock, so use an NSLock.
+        let lock = NSLock()
+
+        for workerIndex in 0..<workerCount {
+            let start = workerIndex * chunkSize
+            guard start < assets.count else { break }
+            let end = min(start + chunkSize, assets.count)
+            group.enter()
+            queue.async {
+                var local: [(Int, AssetMetaSnapshot)] = []
+                local.reserveCapacity(end - start)
+                for i in start..<end {
+                    let a = assets[i]
+                    let snap = AssetMetaSnapshot(
+                        id: a.localIdentifier,
+                        mediaType: a.mediaType,
+                        mediaSubtypes: a.mediaSubtypes,
+                        pixelWidth: a.pixelWidth,
+                        pixelHeight: a.pixelHeight,
+                        duration: a.duration,
+                        creationDate: a.creationDate,
+                        modificationDate: a.modificationDate,
+                        isScreenRecording: false
+                    )
+                    local.append((i, snap))
+                }
+                lock.lock()
+                for (i, snap) in local { result[i] = snap }
+                lock.unlock()
+                group.leave()
+            }
+        }
+        group.wait()
+        return result.compactMap { $0 }
+    }
+
+    /// Routing variant that uses the pre-read `AssetMetaSnapshot`
+    /// instead of touching the PHAsset directly. Same bucketing
+    /// logic as `routeAsset`, just without the lazy-load cost.
+    private func routeFromMeta(
+        meta: AssetMetaSnapshot,
+        categorized: inout [DashboardCategoryKind: [MediaAssetRecord]],
+        duplicateBuckets: inout [String: [MediaAssetRecord]],
+        similarBuckets: inout [String: [MediaAssetRecord]],
+        similarVideoBuckets: inout [String: [MediaAssetRecord]],
+        similarScreenshotBuckets: inout [String: [MediaAssetRecord]]
+    ) -> (MediaAssetRecord, AssetRouting) {
+        // File size estimate (fast pixel-based — no PHAssetResource).
+        let pixelCount = max(meta.pixelWidth * meta.pixelHeight, 1)
+        let size: Int64
+        if meta.mediaType == .video {
+            size = Int64(Double(pixelCount) * max(meta.duration, 1) * 0.08)
+        } else {
+            size = Int64(Double(pixelCount) * 0.45)
+        }
+
+        // Display title / subtitle.
+        let base: String
+        if meta.mediaType == .video {
+            base = "Video"
+        } else if meta.mediaSubtypes.contains(.photoScreenshot) {
+            base = "Screenshot"
+        } else {
+            base = "Photo"
+        }
+        let title: String
+        if let d = meta.creationDate {
+            title = "\(base) \(DateFormatter.cleanupLabel.string(from: d))"
+        } else {
+            title = base
+        }
+        let subtitle = DateFormatter.cleanupShort.string(from: meta.creationDate ?? .now)
+        let isScreenshot = meta.mediaSubtypes.contains(.photoScreenshot)
+
+        let record = MediaAssetRecord(
+            id: meta.id,
+            title: title,
+            subtitle: subtitle,
+            sizeInBytes: size,
+            duration: meta.duration,
+            createdAt: meta.creationDate,
+            modificationAt: meta.modificationDate,
+            mediaType: meta.mediaType,
+            isScreenshot: isScreenshot,
+            pixelWidth: meta.pixelWidth,
+            pixelHeight: meta.pixelHeight
+        )
+
+        // Cache the estimated size so any downstream lookups of
+        // `estimatedFileSize` get a cache hit until the preflight
+        // lands real numbers.
+        let modStamp = meta.modificationDate?.timeIntervalSince1970 ?? 0
+        fileSizeCache["\(meta.id)|\(modStamp)"] = size
+
+        var categories: Set<DashboardCategoryKind> = []
+        var dupKey: String? = nil
+        var simKey: String? = nil
+        var simVideoKey: String? = nil
+        var simShotKey: String? = nil
+
+        if meta.mediaType == .video {
+            let timeBucket = Int((meta.creationDate?.timeIntervalSince1970 ?? 0) / (2 * 3600))
+            let durationBucket = Int(meta.duration / 3)
+            let sizeBucket = Int(size / 2_000_000)
+            let wRounded = max(120, (meta.pixelWidth / 120) * 120)
+            let hRounded = max(120, (meta.pixelHeight / 120) * 120)
+            let videoKey = "\(timeBucket)-\(durationBucket)-\(sizeBucket)-\(wRounded)-\(hRounded)"
+            similarVideoBuckets[videoKey, default: []].append(record)
+            simVideoKey = videoKey
+
+            if meta.isScreenRecording {
+                categorized[.screenRecordings, default: []].append(record)
+                categories.insert(.screenRecordings)
+            } else if meta.duration > 0, meta.duration < 10 {
+                categorized[.shortRecordings, default: []].append(record)
+                categories.insert(.shortRecordings)
+            } else {
+                categorized[.videos, default: []].append(record)
+                categories.insert(.videos)
+            }
+        } else {
+            categorized[.other, default: []].append(record)
+            categories.insert(.other)
+
+            if isScreenshot {
+                categorized[.screenshots, default: []].append(record)
+                categories.insert(.screenshots)
+                let dayBucket = Int((meta.creationDate?.timeIntervalSince1970 ?? 0) / 86_400)
+                let wRounded = max(80, (meta.pixelWidth / 80) * 80)
+                let hRounded = max(80, (meta.pixelHeight / 80) * 80)
+                let screenshotKey = "\(dayBucket)-\(wRounded)-\(hRounded)"
+                similarScreenshotBuckets[screenshotKey, default: []].append(record)
+                simShotKey = screenshotKey
+            } else {
+                let ts = meta.creationDate?.timeIntervalSince1970 ?? 0
+                let w48 = max(48, (meta.pixelWidth / 48) * 48)
+                let h48 = max(48, (meta.pixelHeight / 48) * 48)
+                let areaBucket = max(meta.pixelWidth * meta.pixelHeight, 1) / 350_000
+                let duplicateKey = "\(meta.mediaType.rawValue)-\(meta.pixelWidth)x\(meta.pixelHeight)-\(size)"
+                duplicateBuckets[duplicateKey, default: []].append(record)
+                dupKey = duplicateKey
+
+                let similarKey = "\(Int(ts / 180))-\(w48)-\(h48)-\(areaBucket)"
+                similarBuckets[similarKey, default: []].append(record)
+                simKey = similarKey
+            }
+        }
+
+        return (
+            record,
+            AssetRouting(
+                mediaType: meta.mediaType,
+                categories: categories,
+                duplicateKey: dupKey,
+                similarKey: simKey,
+                similarVideoKey: simVideoKey,
+                similarScreenshotKey: simShotKey
+            )
+        )
+    }
+
+    @discardableResult
+    private func routeAsset(
+        asset: PHAsset,
+        record: MediaAssetRecord,
+        categorized: inout [DashboardCategoryKind: [MediaAssetRecord]],
+        duplicateBuckets: inout [String: [MediaAssetRecord]],
+        similarBuckets: inout [String: [MediaAssetRecord]],
+        similarVideoBuckets: inout [String: [MediaAssetRecord]],
+        similarScreenshotBuckets: inout [String: [MediaAssetRecord]]
+    ) -> AssetRouting {
+        var categories: Set<DashboardCategoryKind> = []
+        var dupKey: String? = nil
+        var simKey: String? = nil
+        var simVideoKey: String? = nil
+        var simShotKey: String? = nil
+
+        if record.mediaType == .video {
+            let videoKey = similarVideoKey(for: asset, size: record.sizeInBytes)
+            similarVideoBuckets[videoKey, default: []].append(record)
+            simVideoKey = videoKey
+            // DEFERRED screen-recording classification. The synchronous
+            // `PHAssetResource.assetResources(for:)` call inside
+            // `isScreenRecordingAsset` was the #1 scan bottleneck on
+            // large libraries — every portrait video triggers a Photos
+            // DB round-trip on MainActor. We now route ALL videos
+            // tentatively below (`.videos` or `.shortRecordings`) based
+            // on duration alone, and a post-scan classifier runs off
+            // MainActor in parallel to promote screen-recording-named
+            // videos into `.screenRecordings`. Accuracy is identical
+            // (same filename check), just happens a second after the
+            // main scan completes instead of inline.
+            if asset.duration > 0, asset.duration < 10 {
+                categorized[.shortRecordings, default: []].append(record)
+                categories.insert(.shortRecordings)
+            } else {
+                categorized[.videos, default: []].append(record)
+                categories.insert(.videos)
+            }
+        } else {
+            categorized[.other, default: []].append(record)
+            categories.insert(.other)
+
+            if record.isScreenshot {
+                categorized[.screenshots, default: []].append(record)
+                categories.insert(.screenshots)
+                let screenshotKey = similarScreenshotKey(for: asset)
+                similarScreenshotBuckets[screenshotKey, default: []].append(record)
+                simShotKey = screenshotKey
+            } else {
+                // Candidate bucket key now includes BOTH pixel
+                // dimensions AND exact file size in bytes. Two
+                // photos can only be bit-exact duplicates if both
+                // match — so narrowing the bucket here means
+                // `verifyDuplicatesByPixel` below only fingerprints
+                // the tiny handful of real candidates instead of
+                // every photo at that resolution.
+                //
+                // Before: key was "image-3024x4032". On an iPhone
+                // EVERY photo lands in that bucket, so pixel
+                // fingerprinting ran on ~30k photos. That's the
+                // main reason duplicate refinement was dragging the
+                // whole app down (it also blocked compression on
+                // the shared main actor).
+                //
+                // The pixel-fingerprint verifier is still the final
+                // source of truth for `.duplicates` — we've just
+                // cut out the photos that CAN'T be duplicates
+                // before it runs.
+                let duplicateKey = duplicateCandidateKey(for: asset, size: record.sizeInBytes)
+                duplicateBuckets[duplicateKey, default: []].append(record)
+                dupKey = duplicateKey
+
+                let similarKey = similarPhotoKey(for: asset)
+                similarBuckets[similarKey, default: []].append(record)
+                simKey = similarKey
+            }
+        }
+
+        return AssetRouting(
+            mediaType: asset.mediaType,
+            categories: categories,
+            duplicateKey: dupKey,
+            similarKey: simKey,
+            similarVideoKey: simVideoKey,
+            similarScreenshotKey: simShotKey
+        )
+    }
+
+    /// Handles a `PHPhotoLibraryChangeObserver` callback by applying
+    /// the delta to the cached bucket state instead of re-indexing the
+    /// whole library. Returns `true` when the incremental path ran
+    /// successfully; `false` means the caller should fall back to a
+    /// full scan (fresh install, no cached state, or iOS reported a
+    /// non-incremental change).
+    @MainActor
+    @discardableResult
+    private func applyIncrementalPhotoLibraryChange(_ change: PHChange) async -> Bool {
+        // Guard against calling mid-scan — a full scan is already
+        // rebuilding the buckets, so we don't need to patch them.
+        guard activeLibraryScanTask == nil else { return true }
+        guard photoAuthorization.isReadable else { return false }
+        guard let previousFetchResult = lastLibraryFetchResult,
+              var buckets = lastLibraryBuckets else {
+            return false
+        }
+        guard let details = change.changeDetails(for: previousFetchResult) else {
+            // Nothing in our fetch result was affected.
+            return true
+        }
+        // When iOS can't express the change as insert/remove/change
+        // arrays (e.g. sort order shifted significantly), fall back to
+        // a full scan so we don't produce stale data.
+        guard details.hasIncrementalChanges else { return false }
+
+        let removedAssets = details.removedObjects
+        let insertedAssets = details.insertedObjects
+        let changedAssets = details.changedObjects
+
+        // Pure no-op change (metadata on unrelated assets, etc).
+        if removedAssets.isEmpty, insertedAssets.isEmpty, changedAssets.isEmpty {
+            lastLibraryFetchResult = details.fetchResultAfterChanges
+            return true
+        }
+
+        // Removed + changed both need to be stripped from their old
+        // buckets. Changed assets get re-inserted below with fresh
+        // routing (size/media-type/screenshot flag could have shifted
+        // after an edit).
+        let idsToStrip = Set(
+            (removedAssets + changedAssets).map(\.localIdentifier)
+        )
+        if !idsToStrip.isEmpty {
+            stripAssetsFromBuckets(idsToStrip, buckets: &buckets)
+            // Vision / feature / face caches are keyed by local ID
+            // and become stale for any removed or mutated asset.
+            for id in idsToStrip {
+                visualSignatureCache.removeValue(forKey: id)
+                semanticFeaturePrintCache.removeValue(forKey: id)
+                faceCountCache.removeValue(forKey: id)
+                faceEmbeddingsCache.removeValue(forKey: id)
+            pixelFingerprintCache.removeValue(forKey: id)
+            }
+        }
+
+        PhotoAssetLookup.shared.remove(
+            localIdentifiers: Set(removedAssets.map(\.localIdentifier))
+        )
+
+        // Insert new + reinsert changed, refreshing metadata for each.
+        let assetsToInsert = insertedAssets + changedAssets
+        var upsertBatch: [MediaAssetRecord] = []
+        upsertBatch.reserveCapacity(assetsToInsert.count)
+
+        for asset in assetsToInsert {
+            PhotoAssetLookup.shared.upsert(asset)
+            let record = makeMediaRecord(from: asset)
+            let routing = routeAsset(
+                asset: asset,
+                record: record,
+                categorized: &buckets.categorized,
+                duplicateBuckets: &buckets.duplicateBuckets,
+                similarBuckets: &buckets.similarBuckets,
+                similarVideoBuckets: &buckets.similarVideoBuckets,
+                similarScreenshotBuckets: &buckets.similarScreenshotBuckets
+            )
+            buckets.assetRouting[record.id] = routing
+            upsertBatch.append(record)
+        }
+
+        if !upsertBatch.isEmpty {
+            await mediaAnalysisStore.upsertMetadataBatch(upsertBatch)
+        }
+        if !removedAssets.isEmpty {
+            await mediaAnalysisStore.deleteAnalyses(
+                for: removedAssets.map(\.localIdentifier)
+            )
+        }
+
+        // Recount from the patched routing map. Routing covers every
+        // asset currently in our caches — a single O(n) pass is plenty
+        // at library sizes and avoids drift from signed-delta math.
+        let newFetch = details.fetchResultAfterChanges
+        totalLibraryItems = newFetch.count
+        var photos = 0
+        var videos = 0
+        for routing in buckets.assetRouting.values {
+            if routing.mediaType == .image { photos += 1 }
+            else if routing.mediaType == .video { videos += 1 }
+        }
+        photoCount = photos
+        videoCount = videos
+
+        // Invalidate refinement signatures so the next visit to a
+        // cluster view re-runs Vision refinement over the patched
+        // buckets. We do NOT wipe the caches themselves — only the
+        // per-asset entries for removed/changed IDs were dropped
+        // above, so the rest of the Vision work is preserved.
+        clusterRefinementSignature.removeAll()
+
+        await applyLibrarySnapshot(
+            categorized: buckets.categorized,
+            duplicateBuckets: buckets.duplicateBuckets,
+            similarBuckets: buckets.similarBuckets,
+            similarVideoBuckets: buckets.similarVideoBuckets,
+            similarScreenshotBuckets: buckets.similarScreenshotBuckets
+        )
+
+        lastLibraryBuckets = buckets
+        lastLibraryFetchResult = newFetch
+
+        scanProgress = totalLibraryItems == 0 ? 0 : 1
+        scannedLibraryItems = totalLibraryItems
+        scanStatusText = totalLibraryItems == 0 ? "No media found yet" : "Library updated"
+
+        // Re-run the pixel-fingerprint verifier so the Duplicates card
+        // doesn't stay at "0 / Zero KB" after a delete or incremental
+        // library change. `applyLibrarySnapshot` always writes
+        // `.duplicates = []` (the raw buckets are coarse and would
+        // give false positives), so without this re-run Duplicates
+        // stays empty until a full rescan. The pixel-fingerprint cache
+        // already persists across assets, so this is cheap — only
+        // buckets whose membership actually changed pay new Vision
+        // work; everything else is a cache hit.
+        pendingRefinementCategories.insert(.duplicates)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.verifyDuplicatesByPixel(candidateBuckets: buckets.duplicateBuckets)
+            self.pendingRefinementCategories.remove(.duplicates)
+        }
+
+        SharedSnapshotWriter.shared.refresh(force: true)
+        return true
+    }
+
+    /// Strips the given IDs from every bucket dict / categorized list
+    /// in `buckets`, using the stored routing map for O(1) lookup
+    /// instead of walking every bucket.
+    private func stripAssetsFromBuckets(_ ids: Set<String>, buckets: inout LibraryBucketsCache) {
+        for id in ids {
+            guard let routing = buckets.assetRouting.removeValue(forKey: id) else {
+                // Unknown asset — fall back to the pessimistic sweep.
+                buckets.categorized = buckets.categorized.mapValues { $0.filter { $0.id != id } }
+                buckets.duplicateBuckets = buckets.duplicateBuckets.mapValues { $0.filter { $0.id != id } }
+                buckets.similarBuckets = buckets.similarBuckets.mapValues { $0.filter { $0.id != id } }
+                buckets.similarVideoBuckets = buckets.similarVideoBuckets.mapValues { $0.filter { $0.id != id } }
+                buckets.similarScreenshotBuckets = buckets.similarScreenshotBuckets.mapValues { $0.filter { $0.id != id } }
+                continue
+            }
+
+            for category in routing.categories {
+                buckets.categorized[category]?.removeAll(where: { $0.id == id })
+            }
+            if let key = routing.duplicateKey {
+                buckets.duplicateBuckets[key]?.removeAll(where: { $0.id == id })
+                if buckets.duplicateBuckets[key]?.isEmpty == true {
+                    buckets.duplicateBuckets.removeValue(forKey: key)
+                }
+            }
+            if let key = routing.similarKey {
+                buckets.similarBuckets[key]?.removeAll(where: { $0.id == id })
+                if buckets.similarBuckets[key]?.isEmpty == true {
+                    buckets.similarBuckets.removeValue(forKey: key)
+                }
+            }
+            if let key = routing.similarVideoKey {
+                buckets.similarVideoBuckets[key]?.removeAll(where: { $0.id == id })
+                if buckets.similarVideoBuckets[key]?.isEmpty == true {
+                    buckets.similarVideoBuckets.removeValue(forKey: key)
+                }
+            }
+            if let key = routing.similarScreenshotKey {
+                buckets.similarScreenshotBuckets[key]?.removeAll(where: { $0.id == id })
+                if buckets.similarScreenshotBuckets[key]?.isEmpty == true {
+                    buckets.similarScreenshotBuckets.removeValue(forKey: key)
+                }
+            }
+        }
+    }
+
+
+    /// Gate-aware wrapper. Callers that know whether they're deleting photos
+    /// or videos should use this; it tracks free-tier usage and pops the
+    /// upgrade sheet when the allowance is exhausted. Ungated legacy callers
+    /// continue to hit `deleteAssets(with:)` directly.
+    @MainActor
+    func deleteAssets(with identifiers: [String], kind: FreeAction) async -> Bool {
+        let unique = Array(Set(identifiers))
+        guard !unique.isEmpty else { return true }
+        let allowed = consumeFreeAllowance(kind, requested: unique.count)
+        guard allowed > 0 else { return false }
+        let slice = Array(unique.prefix(allowed))
+        return await deleteAssets(with: slice)
     }
 
     func deleteAssets(with identifiers: [String]) async -> Bool {
@@ -1160,12 +2490,13 @@ final class AppFlow: ObservableObject {
         allContacts = allRecords.sorted { $0.fullName.localizedCaseInsensitiveCompare($1.fullName) == .orderedAscending }
         incompleteContacts = incompleteRecords.sorted { $0.fullName.localizedCaseInsensitiveCompare($1.fullName) == .orderedAscending }
         duplicateContactGroups = duplicateGroups
+        contactBackupService.refreshBackups()
         contactAnalysisSummary = ContactAnalysisSummary(
             totalCount: allRecords.count,
             duplicateGroupCount: duplicateGroups.count,
             duplicateContactCount: duplicateGroups.reduce(0) { $0 + max(0, $1.duplicateCount - 1) },
             incompleteCount: incompleteRecords.count,
-            backupCount: 0
+            backupCount: contactBackupService.backups.count
         )
 
         isScanningContacts = false
@@ -1320,6 +2651,10 @@ final class AppFlow: ObservableObject {
 
     /// Merge multiple duplicate groups in bulk (single rescan at end)
     func bulkMergeDuplicateContacts(groups: [DuplicateContactGroup]) async -> Int {
+        // Safety net: snapshot contacts before any destructive action, so the
+        // user can always restore if the merge does something they didn't want.
+        await contactBackupService.ensureRecentBackup()
+
         isCleaningContacts = true
         contactCleaningComplete = false
         contactCleaningProgress = (0, groups.count)
@@ -1385,6 +2720,9 @@ final class AppFlow: ObservableObject {
 
     /// Delete contacts by their IDs
     func deleteContacts(ids: Set<String>) async -> Bool {
+        // Safety net before a destructive delete.
+        await contactBackupService.ensureRecentBackup()
+
         let keys: [CNKeyDescriptor] = [
             CNContactIdentifierKey as CNKeyDescriptor
         ]
@@ -1453,6 +2791,86 @@ final class AppFlow: ObservableObject {
 
     func lockSecretSpace() {
         isSecretSpaceUnlocked = false
+    }
+
+    /// Nuclear recovery path for a forgotten PIN: wipes the stored PIN hash,
+    /// the vault directory on disk, and the persisted item list. We don't
+    /// keep a backup anywhere — the whole point of Secret Space is that a
+    /// forgotten PIN means the data is gone. The UI must show a clear
+    /// destructive confirm before calling this.
+    func resetSecretPIN() {
+        UserDefaults.standard.removeObject(forKey: secretPinHashKey)
+        isSecretSpaceUnlocked = false
+        isBiometricUnlockEnabled = false
+
+        // Delete every file in the vault, then clear the index.
+        let directory = secretVaultDirectory()
+        if let contents = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) {
+            for url in contents {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        secretVaultItems.removeAll()
+        persist(secretVaultItems, key: vaultItemsKey)
+    }
+
+    // MARK: - Biometric unlock (Face ID / Touch ID)
+
+    private var biometricEnabledKey: String { "cleanup.secret.biometric.enabled" }
+
+    /// Whether the user opted in to Face ID / Touch ID unlock during PIN
+    /// creation. Stored separately from the PIN hash so the PIN is still
+    /// required if biometrics are disabled at the OS level later.
+    var isBiometricUnlockEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: biometricEnabledKey) }
+        set { UserDefaults.standard.set(newValue, forKey: biometricEnabledKey) }
+    }
+
+    /// Returns a label for the device's biometric, or nil if the device
+    /// can't evaluate biometrics right now (no enrollment, no sensor, user
+    /// disabled it). Safe to call every render.
+    var biometricDisplayName: String? {
+        let context = LAContext()
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
+            return nil
+        }
+        switch context.biometryType {
+        case .faceID: return "Face ID"
+        case .touchID: return "Touch ID"
+        case .opticID: return "Optic ID"
+        default: return nil
+        }
+    }
+
+    /// Prompts Face ID / Touch ID. On success, flips `isSecretSpaceUnlocked`
+    /// to true on the main actor so the vault UI reveals immediately. On
+    /// failure / cancel, does nothing — PIN stays the fallback path.
+    func attemptBiometricUnlock() async -> Bool {
+        guard isBiometricUnlockEnabled, hasSecretPIN else { return false }
+        let context = LAContext()
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
+            return false
+        }
+
+        let reason = "Unlock Secret Space"
+        do {
+            let success = try await context.evaluatePolicy(
+                .deviceOwnerAuthenticationWithBiometrics,
+                localizedReason: reason
+            )
+            if success {
+                await MainActor.run { self.isSecretSpaceUnlocked = true }
+            }
+            return success
+        } catch {
+            return false
+        }
     }
 
     func addSecretVaultItems(from items: [PhotosPickerItem], deleteOriginals: Bool) async -> SecretVaultImportResult {
@@ -1554,7 +2972,14 @@ final class AppFlow: ObservableObject {
             do {
                 try await Self.deletePhotoLibraryAssets(with: eligibleOriginalIdentifiers)
                 deletedOriginalCount = eligibleOriginalIdentifiers.count
-                await scanLibrary()
+                // User just moved N items to the secret vault with
+                // "delete originals" — the library really did change.
+                // `.manual` because this is a user action, not an
+                // auto trigger; the PHChange observer will also fire
+                // the incremental path, but we run this one first to
+                // reflect the deletion in the UI without waiting for
+                // the observer's 400ms debounce.
+                await scanLibrary(trigger: .manual)
             } catch {
                 deletedOriginalCount = 0
             }
@@ -1641,7 +3066,18 @@ final class AppFlow: ObservableObject {
 
         do {
             let imageData = try await requestImageData(for: asset)
-            guard let image = UIImage(data: imageData), let compressedData = image.jpegData(compressionQuality: quality) else {
+            // UIImage decode + `jpegData` re-encode for a full-size
+            // photo is 100-300ms of pure CPU. Running it inline on
+            // the `@MainActor` AppFlow context blocks everything
+            // else that needs the actor — including UI updates on
+            // the Compress screen itself — and contends with
+            // duplicate refinement's Vision tasks. Move it to a
+            // detached background task so it can't starve the UI.
+            let compressedData: Data? = await Task.detached(priority: .userInitiated) {
+                guard let image = UIImage(data: imageData) else { return nil }
+                return image.jpegData(compressionQuality: quality)
+            }.value
+            guard let compressedData else {
                 throw NSError(domain: "Cleanup", code: -8, userInfo: [NSLocalizedDescriptionKey: "Unable to compress this photo."])
             }
 
@@ -1692,6 +3128,14 @@ final class AppFlow: ObservableObject {
         }
         cachedCompressiblePhotos = []
         cachedCompressibleVideos = []
+        // Reset incremental-scan cache so the next granted-access scan
+        // does a proper full indexing instead of diffing against stale
+        // buckets from a previous session. The queued change belongs to
+        // the old fetch result and would be meaningless once the cache
+        // is gone, so drop it too.
+        lastLibraryFetchResult = nil
+        lastLibraryBuckets = nil
+        pendingLibraryChange = nil
         isScanningLibrary = false
         scanProgress = 0
         scanStatusText = "Photo access is required"
@@ -1748,13 +3192,21 @@ final class AppFlow: ObservableObject {
                 }
             }
 
-            let duplicateClusters = buildClusters(from: duplicateBuckets, category: .duplicates)
+            // NOTE: we deliberately DO NOT build duplicate clusters
+            // from `duplicateBuckets` here. Those buckets are coarse
+            // candidates (same resolution, same media type) — iPhone
+            // produces thousands of photos at identical dimensions so
+            // raw candidates would inflate duplicates to 90+ GB of
+            // false positives. The pixel-fingerprint verifier
+            // (`verifyDuplicatesByPixel`, runs post-scan) is the sole
+            // author of `.duplicates`. Until it completes the
+            // Duplicates dashboard card shows zero, not a wrong number.
             let similarClusters = buildClusters(from: similarBuckets, category: .similar)
             let similarVideoClusters = buildClusters(from: similarVideoBuckets, category: .similarVideos)
             let similarScreenshotClusters = buildClusters(from: similarScreenshotBuckets, category: .similarScreenshots)
 
             var workingCategorized = categorized
-            workingCategorized[.duplicates] = flatten(duplicateClusters)
+            workingCategorized[.duplicates] = []
             workingCategorized[.similar] = flatten(similarClusters)
             workingCategorized[.similarVideos] = flatten(similarVideoClusters)
             workingCategorized[.similarScreenshots] = flatten(similarScreenshotClusters)
@@ -1778,7 +3230,7 @@ final class AppFlow: ObservableObject {
             }
 
             let clusters: [DashboardCategoryKind: [MediaCluster]] = [
-                .duplicates: duplicateClusters,
+                .duplicates: [],
                 .similar: similarClusters,
                 .similarVideos: similarVideoClusters,
                 .similarScreenshots: similarScreenshotClusters,
@@ -1795,7 +3247,60 @@ final class AppFlow: ObservableObject {
         // Only lightweight assignments on the main thread
         mediaAssetsByCategory = newAssets
         mediaClustersByCategory = newClusters
+
+        // Re-apply screen-recording promotions from the classifier.
+        // The snapshot above was built from the raw `categorized` dict
+        // (which knows nothing about filename classification), so any
+        // records the classifier has confirmed need to be moved back
+        // out of `.videos` / `.shortRecordings` and into
+        // `.screenRecordings`. Carrying this through on every snapshot
+        // is what makes the Screen Recordings card stay populated
+        // instead of getting wiped at each publish.
+        if !confirmedScreenRecordingIDs.isEmpty {
+            let ids = confirmedScreenRecordingIDs
+            var videos = mediaAssetsByCategory[.videos] ?? []
+            var shorts = mediaAssetsByCategory[.shortRecordings] ?? []
+            var screens = mediaAssetsByCategory[.screenRecordings] ?? []
+            let existingScreenIDs = Set(screens.map(\.id))
+
+            var promoted: [MediaAssetRecord] = []
+            videos.removeAll { rec in
+                if ids.contains(rec.id), !existingScreenIDs.contains(rec.id) {
+                    promoted.append(rec); return true
+                }
+                return false
+            }
+            shorts.removeAll { rec in
+                if ids.contains(rec.id), !existingScreenIDs.contains(rec.id) {
+                    promoted.append(rec); return true
+                }
+                return false
+            }
+            if !promoted.isEmpty {
+                screens.append(contentsOf: promoted)
+                mediaAssetsByCategory[.videos] = videos
+                mediaAssetsByCategory[.shortRecordings] = shorts
+                mediaAssetsByCategory[.screenRecordings] = screens
+            }
+        }
+
         refreshDashboardCategories()
+
+        // `applyLibrarySnapshot` wholesale replaces the cluster maps.
+        // If the current state had been refined earlier (post-scan or
+        // view-triggered), this snapshot just reverted it. Drop the
+        // cached refinement signature so the NEXT refinement trigger
+        // actually runs instead of short-circuiting on "signature
+        // already refined." Refinement itself is gated on
+        // `!isScanningLibrary`, so during a scan we simply wait for
+        // the final post-scan snapshot + post-scan refinement to
+        // drive the deterministic end state.
+        let refinable: [DashboardCategoryKind] = [
+            .similar, .similarScreenshots, .similarVideos, .screenshots
+        ]
+        for category in refinable {
+            clusterRefinementSignature[category] = nil
+        }
     }
 
     private func refreshDashboardCategories() {
@@ -1860,7 +3365,20 @@ final class AppFlow: ObservableObject {
             visualSignatureCache.removeValue(forKey: $0)
             semanticFeaturePrintCache.removeValue(forKey: $0)
             faceCountCache.removeValue(forKey: $0)
+            faceEmbeddingsCache.removeValue(forKey: $0)
+            pixelFingerprintCache.removeValue(forKey: $0)
         }
+
+        // Keep the incremental-scan bucket cache in lockstep with the
+        // user-visible state. If we didn't strip here, the next
+        // `PHPhotoLibraryChangeObserver` callback would diff against
+        // a cache that still contained these IDs and the incremental
+        // path would apply a no-op, leaving stale routing entries.
+        if var buckets = lastLibraryBuckets {
+            stripAssetsFromBuckets(identifiers, buckets: &buckets)
+            lastLibraryBuckets = buckets
+        }
+
         clusterRefinementSignature.removeAll()
         refreshDashboardCategories()
         scanProgress = totalLibraryItems == 0 ? 0 : 1
@@ -1919,30 +3437,62 @@ final class AppFlow: ObservableObject {
 
             let featurePrint = await semanticFeaturePrint(for: asset)
 
+            // Face embeddings were the main cost in this pipeline —
+            // they required a 1024px thumbnail per asset (vs 256px
+            // for everything else) and a second Vision pass per face
+            // crop. For similar/screenshots/videos we no longer ask
+            // for them: scene feature print + face COUNT + time/size
+            // gates are enough to keep clusters honest without the
+            // 10-50× I/O penalty. Identity splitting for similar is
+            // handled by the face-count parity check — different
+            // people will also usually be at different counts OR in
+            // different time windows. Good-enough, and fast.
+            let candidateFaces: [VNFeaturePrintObservation]? = nil
+
+            // Agglomerative matching: the new asset joins a cluster
+            // only if it matches at least one MEMBER of that cluster —
+            // not just the anchor. This prevents the classic drift
+            // bug where photo B matches anchor A loosely, photo C
+            // matches A loosely, but C and B are actually different
+            // people. With transitive pairwise checks, C only joins
+            // the A-B cluster if it matches A OR B (not just A).
             var matchingGroupIndex: Int?
-            for groupIndex in groups.indices {
-                if await shouldPlace(
-                    asset: asset,
-                    signature: signature,
-                    featurePrint: featurePrint,
-                    into: groups[groupIndex],
-                    category: category
-                ) {
-                    matchingGroupIndex = groupIndex
-                    break
+            groupLoop: for groupIndex in groups.indices {
+                for member in groups[groupIndex].members {
+                    if await shouldPlace(
+                        asset: asset,
+                        signature: signature,
+                        featurePrint: featurePrint,
+                        faceEmbeddings: candidateFaces,
+                        againstMember: member,
+                        category: category
+                    ) {
+                        matchingGroupIndex = groupIndex
+                        break groupLoop
+                    }
                 }
             }
 
+            let newMember = ClusterMember(
+                asset: asset,
+                signature: signature,
+                featurePrint: featurePrint,
+                faceEmbeddings: candidateFaces
+            )
+
             if let groupIndex = matchingGroupIndex {
                 groups[groupIndex].assets.append(asset)
+                groups[groupIndex].members.append(newMember)
             } else {
                 groups.append(
                     VisualClusterBucket(
                         anchorAsset: asset,
                         anchorSignature: signature,
                         anchorFeaturePrint: featurePrint,
+                        anchorFaceEmbeddings: candidateFaces,
                         fallbackKey: fallbackKey,
-                        assets: [asset]
+                        assets: [asset],
+                        members: [newMember]
                     )
                 )
             }
@@ -1972,62 +3522,105 @@ final class AppFlow: ObservableObject {
         }
     }
 
+    /// Pairwise cluster merge test. The candidate joins a cluster iff
+    /// it matches at least one existing MEMBER (not just the anchor).
+    /// That single design change is what keeps transitive drift out
+    /// of clusters: photo C can't slip in just because it matches
+    /// anchor A loosely — it must match A or B tightly.
     private func shouldPlace(
         asset: MediaAssetRecord,
         signature: MediaVisualSignature?,
         featurePrint: VNFeaturePrintObservation?,
-        into group: VisualClusterBucket,
+        faceEmbeddings: [VNFeaturePrintObservation]?,
+        againstMember member: ClusterMember,
         category: DashboardCategoryKind
     ) async -> Bool {
-        guard group.assets.count < maximumClusterSize(for: category) else {
-            return false
-        }
-
+        // ── .similar: quick face-count parity ──────────────────────
+        //
+        // Face identity via per-face embeddings turned out to be too
+        // slow for an interactive refinement (needs a 1024px thumb +
+        // per-face Vision pass). We rely on face-count parity as a
+        // cheap identity proxy: photos with different face counts
+        // are clearly different subjects, photos with matching face
+        // counts in the same time window + scene feature print range
+        // are either the same moment or a harmless near-miss. Tiny
+        // accuracy trade for a 10-50× speedup. Duplicates still has
+        // its own strict pixel-fingerprint pass; this loosening does
+        // NOT affect duplicate detection.
         if category == .similar {
             let assetFaceCount = await faceCount(for: asset)
-            let anchorFaceCount = await faceCount(for: group.anchorAsset)
-            guard assetFaceCount == anchorFaceCount else {
+            let memberFaceCount = await faceCount(for: member.asset)
+            guard assetFaceCount == memberFaceCount else {
                 return false
             }
         }
 
-        guard isWithinRefinementWindow(asset, comparedTo: group.anchorAsset, category: category) else {
+        guard isWithinRefinementWindow(asset, comparedTo: member.asset, category: category) else {
             return false
         }
 
-        guard isComparableResolution(asset, comparedTo: group.anchorAsset, category: category) else {
+        guard isComparableResolution(asset, comparedTo: member.asset, category: category) else {
             return false
         }
 
-        let sizeFloor = max(min(asset.sizeInBytes, group.anchorAsset.sizeInBytes), 1)
-        let sizeCeiling = max(asset.sizeInBytes, group.anchorAsset.sizeInBytes)
+        let sizeFloor = max(min(asset.sizeInBytes, member.asset.sizeInBytes), 1)
+        let sizeCeiling = max(asset.sizeInBytes, member.asset.sizeInBytes)
         let sizeRatio = Double(sizeCeiling) / Double(sizeFloor)
         guard sizeRatio <= refinementSizeRatioThreshold(for: category) else {
             return false
         }
 
-        if let featurePrint, let anchorFeaturePrint = group.anchorFeaturePrint {
-            let semanticDistance = Self.featurePrintDistance(from: featurePrint, to: anchorFeaturePrint)
+        if let featurePrint, let memberFeaturePrint = member.featurePrint {
+            let semanticDistance = Self.featurePrintDistance(from: featurePrint, to: memberFeaturePrint)
             guard semanticDistance <= refinementFeatureDistanceThreshold(for: category) else {
                 return false
             }
-
             if category == .similar {
+                // Face identity already verified above (or both have
+                // zero faces, in which case scene similarity IS the
+                // right signal for this pair).
                 return true
             }
         }
 
-        if let signature, let anchorSignature = group.anchorSignature {
-            let hashDistance = Self.hammingDistance(signature.dHash, anchorSignature.dHash)
-            let lumaDistance = abs(signature.meanLuma - anchorSignature.meanLuma)
-            let spreadDistance = abs(signature.spread - anchorSignature.spread)
+        if let signature, let memberSignature = member.signature {
+            let hashDistance = Self.hammingDistance(signature.dHash, memberSignature.dHash)
+            let lumaDistance = abs(signature.meanLuma - memberSignature.meanLuma)
+            let spreadDistance = abs(signature.spread - memberSignature.spread)
 
-            return hashDistance <= refinementHashThreshold(for: category)
+            let coarseMatch = hashDistance <= refinementHashThreshold(for: category)
                 && lumaDistance <= refinementLumaThreshold(for: category)
                 && spreadDistance <= refinementSpreadThreshold(for: category)
+
+            guard coarseMatch else { return false }
+
+            // ── PIXEL-LEVEL VERIFICATION for .duplicates ─────────────
+            //
+            // Every other signal above is perceptual — it tells us
+            // the two images look similar, not that they're actually
+            // the same pixels. For the duplicate category that's not
+            // enough: "duplicate" must mean duplicate, or we flag 90
+            // GB of stuff that's just similar and users lose trust.
+            //
+            // The pixel fingerprint is SHA256 over a 64×64 / 4-bit
+            // quantized render. Matching fingerprints = true
+            // duplicates (iCloud copies, airdrop round-trips, re-
+            // saves). Crops / edits / filters fail this check, which
+            // is exactly what we want.
+            if category == .duplicates {
+                let a = await pixelFingerprint(for: asset)
+                let b = await pixelFingerprint(for: member.asset)
+                guard let a, let b, a == b else {
+                    return false
+                }
+            }
+
+            return true
         }
 
-        return group.fallbackKey == refinementFallbackKey(for: asset, category: category)
+        // No signals at all — reject rather than fall back to a loose
+        // fallback key (which is what was merging unrelated photos).
+        return false
     }
 
     private func refinementFallbackKey(for asset: MediaAssetRecord, category: DashboardCategoryKind) -> String {
@@ -2097,10 +3690,18 @@ final class AppFlow: ObservableObject {
 
     private func refinementHashThreshold(for category: DashboardCategoryKind) -> Int {
         switch category {
+        case .duplicates:
+            // "Duplicate" means near-pixel-identical. dHash over a 9×8
+            // grid has 72 bits — 2 flipped bits = effectively identical
+            // (JPEG re-encoding jitter). Anything higher is "similar",
+            // not "duplicate".
+            return 2
         case .similarScreenshots:
             return 9
         case .similarVideos:
             return 10
+        case .similar:
+            return 8
         default:
             return 11
         }
@@ -2108,10 +3709,14 @@ final class AppFlow: ObservableObject {
 
     private func refinementLumaThreshold(for category: DashboardCategoryKind) -> Int {
         switch category {
+        case .duplicates:
+            return 4
         case .similarScreenshots:
             return 22
         case .similarVideos:
             return 26
+        case .similar:
+            return 18
         default:
             return 24
         }
@@ -2119,10 +3724,14 @@ final class AppFlow: ObservableObject {
 
     private func refinementSpreadThreshold(for category: DashboardCategoryKind) -> Int {
         switch category {
+        case .duplicates:
+            return 4
         case .similarScreenshots:
             return 20
         case .similarVideos:
             return 24
+        case .similar:
+            return 16
         default:
             return 22
         }
@@ -2130,10 +3739,17 @@ final class AppFlow: ObservableObject {
 
     private func refinementSizeRatioThreshold(for category: DashboardCategoryKind) -> Double {
         switch category {
+        case .duplicates:
+            // Within 2% — true duplicates from iCloud sync / airdrop
+            // round-trip vary by < 1%. This is what separates real
+            // duplicates (90 KB vs 91 KB) from re-edits / crops.
+            return 1.02
         case .similarScreenshots:
             return 1.35
         case .similarVideos:
             return 1.8
+        case .similar:
+            return 1.25
         default:
             return 1.5
         }
@@ -2141,10 +3757,18 @@ final class AppFlow: ObservableObject {
 
     private func refinementFeatureDistanceThreshold(for category: DashboardCategoryKind) -> Float {
         switch category {
+        case .duplicates:
+            // Semantic featurePrint distance ≤ 0.06 means the two
+            // images are essentially the same frame.
+            return 0.06
         case .similarScreenshots:
             return 0.18
         case .similarVideos:
             return 0.24
+        case .similar:
+            // Tight: scene feature print alone must be very close.
+            // Face identity is additionally enforced in shouldPlace.
+            return 0.12
         default:
             return 0.20
         }
@@ -2156,6 +3780,12 @@ final class AppFlow: ObservableObject {
             return 12
         case .similarVideos:
             return 12
+        case .similar:
+            // A real "similar" cluster is a burst of near-identical
+            // frames — 8 is already generous. Caps prevent the
+            // "167 photos in one cluster" blow-up when refinement
+            // under-splits.
+            return 8
         default:
             return 20
         }
@@ -2190,6 +3820,12 @@ final class AppFlow: ObservableObject {
     private struct VisionAnalysisResult {
         let featurePrint: VNFeaturePrintObservation?
         let faceCount: Int?
+        /// Feature print per detected face crop (largest faces first,
+        /// capped at `maxFacesPerAsset`). Used as an identity proxy in
+        /// `.similar` clustering. `nil` when the caller didn't ask for
+        /// it; empty array when we ran detection but couldn't produce
+        /// any usable crops.
+        let faceEmbeddings: [VNFeaturePrintObservation]?
     }
 
     private func visualSignature(for asset: MediaAssetRecord) async -> MediaVisualSignature? {
@@ -2235,8 +3871,63 @@ final class AppFlow: ObservableObject {
             return cached
         }
 
-        await ensureAnalysisSignals(for: asset, includeFaceCount: true)
+        await ensureAnalysisSignals(for: asset, includeFaceCount: true, includeFaceEmbeddings: false)
         return faceCountCache[asset.id] ?? 0
+    }
+
+    /// Pixel-level fingerprint for this asset. Two assets sharing a
+    /// fingerprint are pixel-identical at 64×64 / 4-bit quantization —
+    /// i.e. actual duplicates (iCloud copies, airdrop round-trips,
+    /// re-saves). Edits, crops, and filters will produce a different
+    /// fingerprint.
+    private func pixelFingerprint(for asset: MediaAssetRecord) async -> Data? {
+        if let cached = pixelFingerprintCache[asset.id] {
+            return cached
+        }
+        guard let sourceAsset = assetForLookupIdentifier(asset.id) else {
+            return nil
+        }
+
+        // Do the expensive Vision / CoreImage work in a DETACHED task
+        // so it runs on a background thread instead of the
+        // `@MainActor` queue shared with `AppFlow`. Before this, the
+        // thumbnail fetch + fingerprint pass hopped back to main for
+        // every asset, which starved UI work like the Compress
+        // screen's `jpegData` encode — exactly the "compression
+        // stuck during duplicate refinement" bug.
+        let assetID = asset.id
+        let fingerprint: Data? = await Task.detached(priority: .utility) {
+            guard let thumbnail = await Self.requestIndexingThumbnail(for: sourceAsset) else {
+                return nil
+            }
+            return Self.makePixelFingerprint(from: thumbnail.uiImage)
+        }.value
+
+        if let fingerprint {
+            // Hop back to main actor only for the cache write — this
+            // closure is implicitly on `@MainActor` because AppFlow is.
+            pixelFingerprintCache[assetID] = fingerprint
+        }
+        return fingerprint
+    }
+
+    /// Returns per-face feature prints for the asset, or `[]` when the
+    /// asset has no faces. Lazily computed on first call and cached
+    /// in-memory for the rest of the session (not persisted yet — face
+    /// embeddings are cheap to recompute and not worth NSKeyedArchiver
+    /// round-trips for now).
+    private func faceEmbeddings(for asset: MediaAssetRecord) async -> [VNFeaturePrintObservation] {
+        if let cached = faceEmbeddingsCache[asset.id] {
+            return cached
+        }
+        // Skip work entirely if we already know this asset has no faces.
+        if let count = faceCountCache[asset.id], count == 0 {
+            faceEmbeddingsCache[asset.id] = []
+            return []
+        }
+
+        await ensureAnalysisSignals(for: asset, includeFaceCount: true, includeFaceEmbeddings: true)
+        return faceEmbeddingsCache[asset.id] ?? []
     }
 
     private func hydratePersistedAnalysisCaches(for asset: MediaAssetRecord) async {
@@ -2293,14 +3984,19 @@ final class AppFlow: ObservableObject {
         }
     }
 
-    private func ensureAnalysisSignals(for asset: MediaAssetRecord, includeFaceCount: Bool) async {
+    private func ensureAnalysisSignals(
+        for asset: MediaAssetRecord,
+        includeFaceCount: Bool,
+        includeFaceEmbeddings: Bool = false
+    ) async {
         await hydratePersistedAnalysisCaches(for: asset)
 
         let needsVisualSignature = visualSignatureCache[asset.id] == nil
         let needsFeaturePrint = semanticFeaturePrintCache[asset.id] == nil
         let needsFaceCount = includeFaceCount && faceCountCache[asset.id] == nil
+        let needsFaceEmbeddings = includeFaceEmbeddings && faceEmbeddingsCache[asset.id] == nil
 
-        guard needsVisualSignature || needsFeaturePrint || needsFaceCount else {
+        guard needsVisualSignature || needsFeaturePrint || needsFaceCount || needsFaceEmbeddings else {
             return
         }
 
@@ -2310,6 +4006,9 @@ final class AppFlow: ObservableObject {
             if needsFaceCount {
                 faceCountCache[asset.id] = 0
             }
+            if needsFaceEmbeddings {
+                faceEmbeddingsCache[asset.id] = []
+            }
             return
         }
 
@@ -2317,17 +4016,46 @@ final class AppFlow: ObservableObject {
             visualSignatureCache[asset.id] = signature
         }
 
+        // Scene feature print + face COUNT always run on the 256px
+        // thumbnail — both are cheap and robust at that scale.
         if needsFeaturePrint || needsFaceCount {
             let result = await Self.analyzeVisionSignals(
                 from: thumbnail.ciImage,
                 includeFeaturePrint: needsFeaturePrint,
-                includeFaceCount: needsFaceCount
+                includeFaceCount: needsFaceCount,
+                includeFaceEmbeddings: false,
+                maxFaces: 0
             )
             if needsFeaturePrint, let featurePrint = result.featurePrint {
                 semanticFeaturePrintCache[asset.id] = featurePrint
             }
             if needsFaceCount {
                 faceCountCache[asset.id] = result.faceCount ?? 0
+            }
+        }
+
+        // Face embeddings need a much larger thumbnail — feature
+        // prints on a 40px face crop are noisy garbage. We fetch the
+        // 1024px thumbnail only when we actually need embeddings and
+        // the asset has faces (skip otherwise; saves a Photos I/O).
+        if needsFaceEmbeddings {
+            let currentFaceCount = faceCountCache[asset.id] ?? 0
+            if currentFaceCount == 0 {
+                faceEmbeddingsCache[asset.id] = []
+            } else if let hiRes = await Self.requestHighResFaceThumbnail(for: sourceAsset) {
+                let result = await Self.analyzeVisionSignals(
+                    from: hiRes.ciImage,
+                    includeFeaturePrint: false,
+                    includeFaceCount: false,
+                    includeFaceEmbeddings: true,
+                    maxFaces: maxFacesPerAsset
+                )
+                faceEmbeddingsCache[asset.id] = result.faceEmbeddings ?? []
+            } else {
+                // Couldn't fetch high-res thumbnail. Leave empty — the
+                // strict `faceIdentitiesMatch` will then reject any
+                // merge rather than risk a false positive.
+                faceEmbeddingsCache[asset.id] = []
             }
         }
 
@@ -2395,10 +4123,56 @@ final class AppFlow: ObservableObject {
         )
     }
 
+    /// Pixel-level fingerprint for duplicate detection.
+    ///
+    /// Renders the image into a normalized 64×64 grayscale buffer,
+    /// quantizes each pixel to 4 bits (16 levels) so JPEG jitter /
+    /// compression re-encode can't spoil the fingerprint, and takes
+    /// SHA256. Two images with the same fingerprint are the same
+    /// pixel content — that's what "duplicate" actually means.
+    ///
+    /// 4-bit quantization is the sweet spot: lossless bit-for-bit
+    /// compare would over-split (iCloud re-encodes slightly), full
+    /// 8-bit would still split. 16 luma levels survive JPEG jitter
+    /// while still failing on crops, filters, edits.
+    nonisolated private static func makePixelFingerprint(from image: UIImage) -> Data? {
+        guard let cgImage = image.cgImage else { return nil }
+        let side = 64
+        let bytesPerRow = side
+        var pixels = [UInt8](repeating: 0, count: side * side)
+
+        guard let context = CGContext(
+            data: &pixels,
+            width: side,
+            height: side,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else {
+            return nil
+        }
+        context.interpolationQuality = .medium
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: side, height: side))
+
+        // Quantize to 4 bits per pixel. 256 levels → 16 levels.
+        var quantized = [UInt8](repeating: 0, count: (side * side) / 2)
+        for i in 0..<(side * side / 2) {
+            let hi = pixels[2 * i] >> 4
+            let lo = pixels[2 * i + 1] >> 4
+            quantized[i] = (hi << 4) | lo
+        }
+
+        let digest = SHA256.hash(data: Data(quantized))
+        return Data(digest)
+    }
+
     nonisolated private static func analyzeVisionSignals(
         from image: CIImage,
         includeFeaturePrint: Bool,
-        includeFaceCount: Bool
+        includeFaceCount: Bool,
+        includeFaceEmbeddings: Bool,
+        maxFaces: Int
     ) async -> VisionAnalysisResult {
         await performIndexingWork {
             var requests: [VNRequest] = []
@@ -2412,8 +4186,10 @@ final class AppFlow: ObservableObject {
                 featurePrintRequest = request
             }
 
+            // Need face rectangles whenever we want count OR embeddings.
+            let needFaceRects = includeFaceCount || includeFaceEmbeddings
             var faceRequest: VNDetectFaceRectanglesRequest?
-            if includeFaceCount {
+            if needFaceRects {
                 let request = VNDetectFaceRectanglesRequest()
                 request.preferBackgroundProcessing = true
                 configurePreferredComputeDevices(for: request)
@@ -2422,28 +4198,128 @@ final class AppFlow: ObservableObject {
             }
 
             guard !requests.isEmpty else {
-                return VisionAnalysisResult(featurePrint: nil, faceCount: nil)
+                return VisionAnalysisResult(featurePrint: nil, faceCount: nil, faceEmbeddings: nil)
             }
 
             let handler = VNImageRequestHandler(ciImage: image, options: [:])
             do {
                 try handler.perform(requests)
+
+                let faceObservations = faceRequest?.results ?? []
+                let embeddings: [VNFeaturePrintObservation]?
+                if includeFaceEmbeddings {
+                    embeddings = computeFaceEmbeddings(
+                        from: image,
+                        faceObservations: faceObservations,
+                        maxFaces: maxFaces
+                    )
+                } else {
+                    embeddings = nil
+                }
+
                 return VisionAnalysisResult(
                     featurePrint: featurePrintRequest?.results?.first,
-                    faceCount: faceRequest?.results?.count
+                    faceCount: includeFaceCount ? faceObservations.count : nil,
+                    faceEmbeddings: embeddings
                 )
             } catch {
                 return VisionAnalysisResult(
                     featurePrint: nil,
-                    faceCount: includeFaceCount ? 0 : nil
+                    faceCount: includeFaceCount ? 0 : nil,
+                    faceEmbeddings: includeFaceEmbeddings ? [] : nil
                 )
             }
         }
     }
 
+    /// Computes a feature print per face crop as a lightweight identity
+    /// proxy. We don't have a public face-recognition model on iOS, but
+    /// running `VNGenerateImageFeaturePrintRequest` on a tight face crop
+    /// yields embeddings that are markedly closer for the same person
+    /// than for different people — enough to prevent the "everyone at
+    /// the Louvre is one cluster" bug.
+    ///
+    /// Crops the top-`maxFaces` largest face rectangles (with ~25%
+    /// padding so hair/chin aren't clipped), runs the feature-print
+    /// request over each, and returns the successful observations.
+    nonisolated private static func computeFaceEmbeddings(
+        from image: CIImage,
+        faceObservations: [VNFaceObservation],
+        maxFaces: Int
+    ) -> [VNFeaturePrintObservation] {
+        guard !faceObservations.isEmpty, maxFaces > 0 else { return [] }
+
+        // Largest face first — they're the most stable for identity.
+        let sorted = faceObservations.sorted { lhs, rhs in
+            (lhs.boundingBox.width * lhs.boundingBox.height)
+                > (rhs.boundingBox.width * rhs.boundingBox.height)
+        }
+        let top = Array(sorted.prefix(maxFaces))
+
+        let imageExtent = image.extent
+        guard imageExtent.width > 0, imageExtent.height > 0 else { return [] }
+
+        var results: [VNFeaturePrintObservation] = []
+        for face in top {
+            // Vision bounding boxes are normalized (0..1) with origin at
+            // bottom-left. Convert to image pixels and expand slightly.
+            let pad: CGFloat = 0.25
+            let nx = max(0, face.boundingBox.origin.x - face.boundingBox.width * pad * 0.5)
+            let ny = max(0, face.boundingBox.origin.y - face.boundingBox.height * pad * 0.5)
+            let nw = min(1 - nx, face.boundingBox.width * (1 + pad))
+            let nh = min(1 - ny, face.boundingBox.height * (1 + pad))
+
+            let pixelRect = CGRect(
+                x: imageExtent.origin.x + nx * imageExtent.width,
+                y: imageExtent.origin.y + ny * imageExtent.height,
+                width: nw * imageExtent.width,
+                height: nh * imageExtent.height
+            )
+
+            // Reject degenerate / tiny crops that'd make a noisy print.
+            // At 1024×1024 thumbnail scale a face smaller than 64px
+            // is too far / too occluded to produce a stable identity
+            // embedding — we'd rather return empty (and let the
+            // strict matcher reject the merge) than include noise.
+            guard pixelRect.width >= 64, pixelRect.height >= 64 else { continue }
+
+            let cropped = image.cropped(to: pixelRect)
+
+            let request = VNGenerateImageFeaturePrintRequest()
+            request.imageCropAndScaleOption = .scaleFit
+            request.preferBackgroundProcessing = true
+            configurePreferredComputeDevices(for: request)
+
+            let handler = VNImageRequestHandler(ciImage: cropped, options: [:])
+            do {
+                try handler.perform([request])
+                if let print = request.results?.first {
+                    results.append(print)
+                }
+            } catch {
+                continue
+            }
+        }
+        return results
+    }
+
     /// Fetch a small 256×256 thumbnail for indexing. This is I/O-bound work
     /// so it does NOT hold the indexing semaphore — only Vision compute should.
     nonisolated private static func requestIndexingThumbnail(for asset: PHAsset) async -> IndexingThumbnail? {
+        await requestThumbnail(for: asset, targetSize: indexingTargetSize)
+    }
+
+    /// Larger thumbnail for face embedding. On a 256×256 indexing
+    /// thumbnail a detected face is often only 40–80px wide — too
+    /// small for Vision's image-feature-print to produce a stable
+    /// identity signal. At 1024×1024 the same face is 150–300px,
+    /// which gives feature prints that actually separate different
+    /// people. This is only fetched when we know the asset has faces.
+    nonisolated private static func requestHighResFaceThumbnail(for asset: PHAsset) async -> IndexingThumbnail? {
+        await requestThumbnail(for: asset, targetSize: CGSize(width: 1024, height: 1024))
+    }
+
+    nonisolated private static func requestThumbnail(for asset: PHAsset, targetSize: CGSize) async -> IndexingThumbnail? {
         let options = PHImageRequestOptions()
         options.deliveryMode = .fastFormat
         options.resizeMode = .fast
@@ -2456,7 +4332,7 @@ final class AppFlow: ObservableObject {
 
             indexingImageManager.requestImage(
                 for: asset,
-                targetSize: indexingTargetSize,
+                targetSize: targetSize,
                 contentMode: .aspectFit,
                 options: options
             ) { image, info in
@@ -2542,6 +4418,65 @@ final class AppFlow: ObservableObject {
         }
     }
 
+    /// Decides whether two photos show the same person / group of
+    /// people. We already rejected earlier when face COUNTS differ;
+    /// this enforces face IDENTITY.
+    ///
+    /// Strategy: greedy bipartite match. For each anchor face, find
+    /// the nearest unused candidate face; if its distance is under
+    /// `faceIdentityDistanceThreshold`, consume it. If any anchor
+    /// face fails to match, the photos are not "similar" — they're
+    /// two different people at the same place.
+    ///
+    /// Strict mode: when one side has embeddings and the other does
+    /// NOT (face detected but we couldn't crop — tiny profile face,
+    /// heavy occlusion), we **reject** rather than merge. Being
+    /// over-aggressive about splitting is the right failure mode
+    /// here: "me + my partner at the Louvre" being in the same
+    /// cluster is a much worse bug than the same person's burst
+    /// getting split into two clusters.
+    private func faceIdentitiesMatch(
+        candidate: [VNFeaturePrintObservation],
+        anchor: [VNFeaturePrintObservation]
+    ) -> Bool {
+        // If either side failed to produce embeddings despite having
+        // faces, bail out — we'd rather over-split than risk a false
+        // merge of two different people.
+        if anchor.isEmpty || candidate.isEmpty {
+            return false
+        }
+
+        // Each side must be able to account for every face on the
+        // other side. We run the bipartite match from the larger
+        // side so the smaller doesn't trivially match.
+        let (left, right) = anchor.count >= candidate.count
+            ? (anchor, candidate)
+            : (candidate, anchor)
+
+        var available = Array(right.indices)
+        for face in left {
+            var bestIndex: Int?
+            var bestDistance: Float = .greatestFiniteMagnitude
+            for (arrayIdx, rightIdx) in available.enumerated() {
+                let d = Self.featurePrintDistance(
+                    from: face,
+                    to: right[rightIdx]
+                )
+                if d < bestDistance {
+                    bestDistance = d
+                    bestIndex = arrayIdx
+                }
+            }
+            guard let matchIndex = bestIndex,
+                  bestDistance <= faceIdentityDistanceThreshold
+            else {
+                return false
+            }
+            available.remove(at: matchIndex)
+        }
+        return true
+    }
+
     private func libraryScanStatusText(processedCount: Int, totalCount: Int) -> String {
         if totalCount > quickScanReadyCount, processedCount >= quickScanReadyCount, processedCount < totalCount {
             return "Quick results are ready. Scanning older media in the background..."
@@ -2570,29 +4505,414 @@ final class AppFlow: ObservableObject {
         )
     }
 
-    private func estimatedFileSize(for asset: PHAsset) -> Int64 {
-        let pixelCount = max(asset.pixelWidth * asset.pixelHeight, 1)
-        if asset.mediaType == .video {
-            return Int64(Double(pixelCount) * max(asset.duration, 1) * 0.08)
+    /// Result of the scan-time preflight. Everything in here is keyed
+    /// so the MainActor merge can drop entries straight into
+    /// `fileSizeCache` (keyed by `fileSizeCacheKey`) and
+    /// `originalFilenameCache` (keyed by `localIdentifier`).
+    private struct ResourcePreflightResult: Sendable {
+        var sizes: [String: Int64]
+        var filenames: [String: String?]
+    }
+
+    /// Fans `PHAssetResource.assetResources(for:)` across a bounded
+    /// number of background workers and returns a map of file sizes
+    /// plus, for videos that could be screen recordings, their
+    /// lowercased original filename. Runs off MainActor — the Photos
+    /// framework itself is thread-safe for these lookups; the "Fetching
+    /// on demand on the main queue" warning fires only when the main
+    /// thread is the one waiting. Moving the wait to background workers
+    /// and fanning out is the key speedup.
+    ///
+    /// Concurrency is capped at 8 so we don't drown Photos' internal
+    /// serial queue. Empirically anything over ~8 workers on an iPhone
+    /// stops scaling and starts adding contention.
+    /// Merges a preflight chunk into the MainActor caches, but only
+    /// if the scan generation that owns it is still current. If the
+    /// user restarted the scan (tapped refresh, changed permissions,
+    /// etc.) a stale preflight worker finishing in the background
+    /// must not poison the new scan's state.
+    @MainActor
+    private func mergePreflightResultsIfCurrent(
+        _ result: ResourcePreflightResult,
+        generation: Int
+    ) {
+        guard generation == libraryScanGeneration else { return }
+        for (cacheKey, size) in result.sizes {
+            fileSizeCache[cacheKey] = size
         }
-        return Int64(Double(pixelCount) * 0.45)
+        for (localID, filename) in result.filenames {
+            originalFilenameCache[localID] = .some(filename)
+        }
+    }
+
+    /// Batched, parallel screen-recording filename classifier. Given
+    /// the set of portrait videos the scan routed tentatively as
+    /// `.videos` or `.shortRecordings`, streams back the subset whose
+    /// `PHAssetResource.originalFilename` matches an iOS screen-
+    /// recording pattern (`rpreplay*`, `screen recording*`).
+    ///
+    /// Runs off MainActor with 8 concurrent workers and streams
+    /// results via `chunkCallback` as each worker chunk finishes —
+    /// so the Screen Recordings card fills in progressively during
+    /// the scan instead of appearing all at once at the end.
+    nonisolated private static func classifyScreenRecordings(
+        candidates: [PHAsset],
+        chunkCallback: (@Sendable (Set<String>) async -> Void)? = nil
+    ) async -> Set<String> {
+        guard !candidates.isEmpty else { return [] }
+        let workerCount = min(8, max(1, ProcessInfo.processInfo.activeProcessorCount))
+
+        // Chunk size controls the streaming cadence. Smaller chunks =
+        // more frequent UI updates during the scan. Measured on a 5K-
+        // candidate library: 50 items per chunk gives ~14 visible
+        // waves of Screen Recordings updates over the classifier's
+        // ~13-second lifetime, with only ~3% MainActor overhead from
+        // the callback dispatch. Larger (200+) means the card feels
+        // like it appears at the end; smaller (<25) starts eating
+        // measurable MainActor time and fighting the routing loop.
+        let chunkSize = 50
+        var chunks: [[PHAsset]] = []
+        var cursor = 0
+        while cursor < candidates.count {
+            let end = min(cursor + chunkSize, candidates.count)
+            chunks.append(Array(candidates[cursor..<end]))
+            cursor = end
+        }
+
+        return await withTaskGroup(of: Set<String>.self) { group in
+            var chunkIterator = chunks.makeIterator()
+            var active = 0
+
+            func addNextChunk() {
+                guard let chunk = chunkIterator.next() else { return }
+                active += 1
+                group.addTask {
+                    var local = Set<String>()
+                    for asset in chunk {
+                        let resources = PHAssetResource.assetResources(for: asset)
+                        guard let filename = resources.first?.originalFilename else { continue }
+                        let lower = filename.lowercased()
+                        if lower.hasPrefix("rpreplay")
+                            || lower.hasPrefix("screen recording")
+                            || lower.hasPrefix("screenrecording") {
+                            local.insert(asset.localIdentifier)
+                        }
+                    }
+                    return local
+                }
+            }
+
+            for _ in 0..<workerCount { addNextChunk() }
+
+            var merged = Set<String>()
+            while active > 0 {
+                guard let partial = await group.next() else { break }
+                active -= 1
+                if !partial.isEmpty, let chunkCallback {
+                    await chunkCallback(partial)
+                }
+                merged.formUnion(partial)
+                addNextChunk()
+            }
+            return merged
+        }
+    }
+
+    /// Streams screen-recording classifier results into the live
+    /// `mediaAssetsByCategory[.screenRecordings]` bucket on MainActor.
+    /// Moves matching records out of `.videos` / `.shortRecordings`
+    /// and into `.screenRecordings` without waiting for the whole
+    /// classifier to finish. The Screen Recordings card's count and
+    /// byte total grow progressively during the scan.
+    ///
+    /// Also accumulates IDs into `confirmedScreenRecordingIDs` so
+    /// that subsequent `applyLibrarySnapshot` calls during the same
+    /// scan carry the promotion forward — snapshots wholesale replace
+    /// `mediaAssetsByCategory`, so without this persistent set the
+    /// promotion would vanish on the next snapshot.
+    @MainActor
+    private func promoteScreenRecordings(
+        ids: Set<String>,
+        generation: Int
+    ) {
+        guard generation == libraryScanGeneration else { return }
+        guard !ids.isEmpty else { return }
+
+        // Persistent record for future snapshots.
+        confirmedScreenRecordingIDs.formUnion(ids)
+
+        // Move from `.videos` / `.shortRecordings` into `.screenRecordings`
+        // in the CURRENT `mediaAssetsByCategory` so the UI updates now.
+        var videos = mediaAssetsByCategory[.videos] ?? []
+        var shorts = mediaAssetsByCategory[.shortRecordings] ?? []
+        var screens = mediaAssetsByCategory[.screenRecordings] ?? []
+        let existingScreenIDs = Set(screens.map(\.id))
+
+        var promoted: [MediaAssetRecord] = []
+        videos.removeAll { rec in
+            if ids.contains(rec.id), !existingScreenIDs.contains(rec.id) {
+                promoted.append(rec)
+                return true
+            }
+            return false
+        }
+        shorts.removeAll { rec in
+            if ids.contains(rec.id), !existingScreenIDs.contains(rec.id) {
+                promoted.append(rec)
+                return true
+            }
+            return false
+        }
+        if promoted.isEmpty { return }
+        screens.append(contentsOf: promoted)
+
+        mediaAssetsByCategory[.videos] = videos
+        mediaAssetsByCategory[.shortRecordings] = shorts
+        mediaAssetsByCategory[.screenRecordings] = screens
+        refreshDashboardCategories()
+    }
+
+    nonisolated private static func preflightAssetResources(
+        for assets: [PHAsset],
+        maxConcurrency: Int = 8,
+        chunkCallback: (@Sendable (ResourcePreflightResult) async -> Void)? = nil
+    ) async -> ResourcePreflightResult {
+        guard !assets.isEmpty else {
+            return ResourcePreflightResult(sizes: [:], filenames: [:])
+        }
+
+        let workerCount = min(maxConcurrency, max(1, ProcessInfo.processInfo.activeProcessorCount))
+
+        // Chunk size of ~200 (instead of "total / workers") means each
+        // worker finishes a chunk every second or two and the caller's
+        // chunkCallback fires repeatedly — the routing loop sees cache
+        // entries appear continuously rather than all at the end. 200
+        // also matches the routing loop's snapshot-publish cadence, so
+        // progress roughly tracks.
+        let chunkSize = 200
+
+        var chunks: [[PHAsset]] = []
+        var cursor = 0
+        while cursor < assets.count {
+            let end = min(cursor + chunkSize, assets.count)
+            chunks.append(Array(assets[cursor..<end]))
+            cursor = end
+        }
+
+        return await withTaskGroup(of: ResourcePreflightResult.self) { group in
+            // Bound the group to `workerCount` concurrent chunks.
+            var chunkIterator = chunks.makeIterator()
+            var active = 0
+
+            func addNextChunk() {
+                guard let chunk = chunkIterator.next() else { return }
+                active += 1
+                group.addTask {
+                    var localSizes: [String: Int64] = [:]
+                    var localFilenames: [String: String?] = [:]
+                    localSizes.reserveCapacity(chunk.count)
+
+                    for asset in chunk {
+                        let resources = PHAssetResource.assetResources(for: asset)
+
+                        var sized: Int64 = 0
+                        for resource in resources {
+                            if let bytes = resource.value(forKey: "fileSize") as? Int64, bytes > 0 {
+                                sized = bytes
+                                break
+                            }
+                            if let bytes = resource.value(forKey: "fileSize") as? NSNumber {
+                                let intBytes = bytes.int64Value
+                                if intBytes > 0 {
+                                    sized = intBytes
+                                    break
+                                }
+                            }
+                        }
+                        if sized > 0 {
+                            let modificationStamp = asset.modificationDate?.timeIntervalSince1970 ?? 0
+                            let key = "\(asset.localIdentifier)|\(modificationStamp)"
+                            localSizes[key] = sized
+                        }
+
+                        if asset.mediaType == .video,
+                           asset.pixelHeight >= asset.pixelWidth {
+                            if let filename = resources.first?.originalFilename {
+                                localFilenames[asset.localIdentifier] = filename.lowercased()
+                            } else {
+                                localFilenames[asset.localIdentifier] = Optional<String>.none
+                            }
+                        }
+                    }
+
+                    return ResourcePreflightResult(sizes: localSizes, filenames: localFilenames)
+                }
+            }
+
+            // Prime the group with up to `workerCount` concurrent chunks.
+            for _ in 0..<workerCount { addNextChunk() }
+
+            var merged = ResourcePreflightResult(sizes: [:], filenames: [:])
+            merged.sizes.reserveCapacity(assets.count)
+
+            while active > 0 {
+                guard let partial = await group.next() else { break }
+                active -= 1
+                // Stream this chunk to the caller as soon as it finishes
+                // — don't wait until the whole preflight is done.
+                if let chunkCallback {
+                    await chunkCallback(partial)
+                }
+                for (key, value) in partial.sizes {
+                    merged.sizes[key] = value
+                }
+                for (key, value) in partial.filenames {
+                    merged.filenames[key] = value
+                }
+                // Start the next chunk to keep the pipeline full.
+                addNextChunk()
+            }
+            return merged
+        }
+    }
+
+    private func estimatedFileSize(for asset: PHAsset) -> Int64 {
+        // HOT-PATH FAST RETURN. The scan loop calls this 37K+ times on
+        // MainActor. Going through `PHAssetResource.assetResources(for:)`
+        // here is the reason first-scan used to take 2+ minutes — every
+        // call is a synchronous Photos-DB XPC round-trip and iOS even
+        // logs "Fetching on demand on the main queue" for each one.
+        //
+        // New order of operations:
+        //   1. In-memory cache hit → return immediately (µs).
+        //   2. No cache → return a pixel-count estimate immediately
+        //      (arithmetic only, no I/O). Scan keeps flying.
+        //   3. The parallel preflight (fired from `performLibraryScan`)
+        //      backfills the real `PHAssetResource` size into the cache
+        //      moments later. The dashboard's total-bytes counter
+        //      corrects itself as soon as the preflight lands (see
+        //      `mergePreflightResultsIfCurrent`).
+        //
+        // Duplicate detection is unaffected: the coarse estimate means
+        // multiple unrelated photos at the same resolution land in the
+        // same candidate bucket, but `verifyDuplicatesByPixel` is the
+        // actual duplicate judge — it compares pixel fingerprints and
+        // rejects any non-matches. So we trade a slightly larger
+        // candidate set for a ~100× faster scan, and the verifier's
+        // per-bucket-member cost is what stays bounded.
+        let cacheKey = fileSizeCacheKey(for: asset)
+        if let cached = fileSizeCache[cacheKey] {
+            return cached
+        }
+
+        let pixelCount = max(asset.pixelWidth * asset.pixelHeight, 1)
+        let estimate: Int64
+        if asset.mediaType == .video {
+            // Video: roughly 0.08 bytes per pixel per second (H.264 iPhone
+            // average at ~30 fps, standard bitrate). Duration × pixel
+            // area × 0.08 gives us order-of-magnitude right.
+            estimate = Int64(Double(pixelCount) * max(asset.duration, 1) * 0.08)
+        } else {
+            // JPEG / HEIC iPhone photos: ~0.45 bytes per pixel with
+            // iPhone camera settings. Good enough for bucket totals
+            // until the preflight lands the real number.
+            estimate = Int64(Double(pixelCount) * 0.45)
+        }
+        // Cache the estimate too so the scan's repeat visits are O(1).
+        // The preflight will overwrite with the real size when it lands.
+        fileSizeCache[cacheKey] = estimate
+        return estimate
+    }
+
+    /// Byte-exact size via `PHAssetResource`. Called on demand from the
+    /// preflight workers (off MainActor) and any code path that needs
+    /// real numbers (e.g. deciding compression target size). The scan
+    /// hot path deliberately does NOT use this — see `estimatedFileSize`.
+    private func preciseFileSize(for asset: PHAsset) -> Int64 {
+        let cacheKey = fileSizeCacheKey(for: asset)
+        if let cached = fileSizeCache[cacheKey] {
+            return cached
+        }
+        let resources = PHAssetResource.assetResources(for: asset)
+        for resource in resources {
+            if let bytes = resource.value(forKey: "fileSize") as? Int64, bytes > 0 {
+                fileSizeCache[cacheKey] = bytes
+                return bytes
+            }
+            if let bytes = resource.value(forKey: "fileSize") as? NSNumber {
+                let intBytes = bytes.int64Value
+                if intBytes > 0 {
+                    fileSizeCache[cacheKey] = intBytes
+                    return intBytes
+                }
+            }
+        }
+
+        // Fallback only if the resource lookup fails (shouldn't happen
+        // for local assets). The formula is a wild guess but matches
+        // the pre-fix behaviour so we at least don't crash or show 0.
+        // Cache the fallback too — otherwise assets whose resource
+        // lookup returns zero bytes (iCloud originals not yet
+        // downloaded, etc.) would re-hit PHAssetResource every scan.
+        let pixelCount = max(asset.pixelWidth * asset.pixelHeight, 1)
+        let fallback: Int64
+        if asset.mediaType == .video {
+            fallback = Int64(Double(pixelCount) * max(asset.duration, 1) * 0.08)
+        } else {
+            fallback = Int64(Double(pixelCount) * 0.45)
+        }
+        fileSizeCache[cacheKey] = fallback
+        return fallback
+    }
+
+    private func fileSizeCacheKey(for asset: PHAsset) -> String {
+        // Invalidate the cached size if the asset was edited (Photos
+        // updates modificationDate on every crop / filter / adjustment).
+        let modificationStamp = asset.modificationDate?.timeIntervalSince1970 ?? 0
+        return "\(asset.localIdentifier)|\(modificationStamp)"
     }
 
     private func isScreenRecordingAsset(_ asset: PHAsset) -> Bool {
         guard asset.mediaType == .video else { return false }
-        // Cheap pre-filter: screen recordings are captured at the device's
-        // native screen resolution, portrait-oriented, and don't come from
-        // the camera. Everything that fails this is definitely not a screen
-        // recording, so we skip the expensive PHAssetResource lookup (which
-        // triggers a main-queue PHAssetOriginalMetadataProperties fetch and
-        // spams the log at scan time).
+        // Portrait-orientation pre-filter: every screen recording iOS
+        // produces is captured in portrait (height >= width). This
+        // filter is CORRECT — landscape videos are camera captures.
+        // We keep this because it's essentially free (two Int reads).
         guard asset.pixelHeight >= asset.pixelWidth else { return false }
-        guard isLikelyScreenResolution(width: asset.pixelWidth, height: asset.pixelHeight) else {
-            return false
+
+        // Filename check. Previously we gated this behind a hardcoded
+        // iPhone-screen-resolution whitelist, but that list is:
+        //   - incomplete (missing iPhone 13 PM, XS Max, 11 PM, etc.)
+        //   - wrong for scaled recordings and AirPlay captures
+        //   - wrong for recordings transferred from other devices
+        // Result: users with ~1000 screen recordings saw only 3
+        // detected. The filename pattern (`rpreplay*`, `screen
+        // recording*`) is the ground truth that iOS uses.
+        //
+        // Fetching `PHAssetResource.assetResources(for:)` for every
+        // video during scan WAS the main-thread bottleneck, but
+        // `originalFilename` alone doesn't trigger the slow
+        // `PHAssetOriginalMetadataProperties` fetch — only `fileSize`
+        // does. So reading the filename here is cheap enough for the
+        // subset of videos that pass the portrait gate.
+        //
+        // The background preflight still populates
+        // `originalFilenameCache` for all videos in parallel, so
+        // repeated scans hit the cache and skip PHAssetResource
+        // entirely after the first pass.
+        if let cachedFilename = originalFilenameCache[asset.localIdentifier] {
+            guard let lower = cachedFilename else { return false }
+            return lower.hasPrefix("rpreplay")
+                || lower.hasPrefix("screen recording")
+                || lower.hasPrefix("screenrecording")
         }
         let resources = PHAssetResource.assetResources(for: asset)
-        guard let filename = resources.first?.originalFilename else { return false }
+        guard let filename = resources.first?.originalFilename else {
+            originalFilenameCache[asset.localIdentifier] = .some(nil)
+            return false
+        }
         let lower = filename.lowercased()
+        originalFilenameCache[asset.localIdentifier] = .some(lower)
         return lower.hasPrefix("rpreplay")
             || lower.hasPrefix("screen recording")
             || lower.hasPrefix("screenrecording")
@@ -2802,15 +5122,38 @@ final class AppFlow: ObservableObject {
         }
     }
 
-    private func exactDuplicateKey(for asset: PHAsset, size: Int64) -> String {
-        let timeBucket = Int((asset.creationDate?.timeIntervalSince1970 ?? 0) / 60)
-        return [asset.mediaType.rawValue.description, "\(asset.pixelWidth)x\(asset.pixelHeight)", "\(size)", "\(timeBucket)"].joined(separator: "-")
+    /// Coarse candidate-bucket key for duplicates — used ONLY to
+    /// pair up photos that *might* be duplicates before the pixel
+    /// pass verifies them. iPhones produce billions of photos at the
+    /// same pixel dimensions, so this key is deliberately loose; the
+    /// real duplicate decision lives in `verifyDuplicatesByPixel`
+    /// which compares actual pixel content. Keying by resolution +
+    /// media type alone keeps this O(1) and moves the expensive
+    /// fingerprint work to a bounded post-scan pass.
+    /// Coarse candidate key for the pixel-fingerprint verifier.
+    /// Must identify photos that COULD be bit-exact duplicates —
+    /// i.e. same media type, same dimensions, same exact byte size.
+    /// Anything that differs on ANY of those three can't be a pixel
+    /// duplicate, so we don't waste a Vision pass on it.
+    ///
+    /// Note: file size alone is not sufficient (two different photos
+    /// can coincidentally share a byte count); the pixel-fingerprint
+    /// verifier is still the source of truth. This key is purely a
+    /// cheap pre-filter so refinement finishes in seconds instead of
+    /// minutes on a 30k-photo library.
+    private func duplicateCandidateKey(for asset: PHAsset, size: Int64) -> String {
+        return "\(asset.mediaType.rawValue)-\(asset.pixelWidth)x\(asset.pixelHeight)-\(size)"
     }
 
     private func similarPhotoKey(for asset: PHAsset) -> String {
+        // Tighter time window (3 min) so a 2-hour photoshoot can't
+        // all land in the same initial bucket before refinement even
+        // runs. Refinement will further split on face identity + scene
+        // feature print, but keeping buckets small is what saves us
+        // when refinement is deferred or skipped.
         let timestamp = asset.creationDate?.timeIntervalSince1970 ?? 0
         return [
-            Int(timestamp / (15 * 60)).description,
+            Int(timestamp / (3 * 60)).description,
             roundedValue(asset.pixelWidth, unit: 48).description,
             roundedValue(asset.pixelHeight, unit: 48).description,
             Int(max(asset.pixelWidth * asset.pixelHeight, 1) / 350_000).description
@@ -3056,6 +5399,16 @@ extension PHAuthorizationStatus {
     var isReadable: Bool {
         self == .authorized || self == .limited
     }
+
+    /// When true, `PHPhotoLibrary.requestAuthorization` will NOT show the
+    /// system dialog again — iOS only prompts for `.notDetermined`. Once
+    /// a user has denied (or MDM restricted) access, the only way to grant
+    /// it is by deep-linking to iOS Settings → <App> → Photos. The
+    /// permission CTAs check this so a "denied" user sees "Open Settings"
+    /// instead of a button that silently does nothing.
+    var needsSettingsRedirect: Bool {
+        self == .denied || self == .restricted
+    }
 }
 
 extension CNAuthorizationStatus {
@@ -3077,12 +5430,29 @@ extension EKAuthorizationStatus {
     }
 }
 
+private struct ClusterMember {
+    let asset: MediaAssetRecord
+    let signature: MediaVisualSignature?
+    let featurePrint: VNFeaturePrintObservation?
+    let faceEmbeddings: [VNFeaturePrintObservation]?
+}
+
 private struct VisualClusterBucket {
     let anchorAsset: MediaAssetRecord
     let anchorSignature: MediaVisualSignature?
     let anchorFeaturePrint: VNFeaturePrintObservation?
+    /// Per-face embeddings for the anchor. Populated only for the
+    /// `.similar` category (the only one that needs identity-aware
+    /// clustering); `nil` for screenshots / videos where face identity
+    /// isn't part of the decision.
+    let anchorFaceEmbeddings: [VNFeaturePrintObservation]?
     let fallbackKey: String
     var assets: [MediaAssetRecord]
+    /// Full snapshot of every member's signals. Agglomerative
+    /// clustering compares the candidate to all members, not just
+    /// the anchor, so drift is impossible (C only joins A-B if it
+    /// matches A OR B — not just A).
+    var members: [ClusterMember]
 }
 
 struct MediaVisualSignature: Hashable, Sendable {
@@ -3127,4 +5497,56 @@ private extension DateFormatter {
         formatter.dateFormat = "MMM d • h:mm a"
         return formatter
     }()
+}
+
+// MARK: - Photo library change bridge
+
+/// Thin `NSObject` that adapts `PHPhotoLibraryChangeObserver` (an Obj-C
+/// protocol) into a Swift callback AppFlow can hook. Callbacks arrive on
+/// an arbitrary background queue — the handler bounces to the main actor.
+/// The `PHChange` is passed through so the handler can call
+/// `changeDetails(for:)` against the last cached `PHFetchResult` and
+/// apply an incremental diff rather than doing a full rescan.
+final class PhotoLibraryChangeBridge: NSObject, PHPhotoLibraryChangeObserver {
+    private let onChange: (PHChange) -> Void
+
+    init(onChange: @escaping (PHChange) -> Void) {
+        self.onChange = onChange
+        super.init()
+    }
+
+    func photoLibraryDidChange(_ changeInstance: PHChange) {
+        onChange(changeInstance)
+    }
+}
+
+// MARK: - Incremental scan support types
+
+/// Intermediate bucket state produced by a full library scan and
+/// preserved so that `PHPhotoLibraryChangeObserver` can patch it in
+/// place when the library changes. The same bucket dicts are the
+/// input to `applyLibrarySnapshot`, so patched output is bit-for-bit
+/// what a full rescan would produce.
+struct LibraryBucketsCache {
+    var categorized: [DashboardCategoryKind: [MediaAssetRecord]]
+    var duplicateBuckets: [String: [MediaAssetRecord]]
+    var similarBuckets: [String: [MediaAssetRecord]]
+    var similarVideoBuckets: [String: [MediaAssetRecord]]
+    var similarScreenshotBuckets: [String: [MediaAssetRecord]]
+    /// Remembers which buckets each asset was routed into, so a remove
+    /// or change can strip it from exactly the buckets it's in without
+    /// scanning every bucket key for a match.
+    var assetRouting: [String: AssetRouting]
+}
+
+/// Where a single asset was routed during bucket assignment. Needed
+/// for O(1) incremental removes — without it we'd have to walk every
+/// bucket dict looking for the asset ID.
+struct AssetRouting {
+    let mediaType: PHAssetMediaType
+    let categories: Set<DashboardCategoryKind>
+    let duplicateKey: String?
+    let similarKey: String?
+    let similarVideoKey: String?
+    let similarScreenshotKey: String?
 }

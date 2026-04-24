@@ -40,20 +40,6 @@ struct EmailCleanerView: View {
     @State private var isLoadingDetail = false
     @State private var detailErrorMessage: String?
 
-    private let previewSenders: [GmailSenderSummary] = [
-        .init(id: "google", name: "Google", email: "no-reply@accounts.google.com", emailCount: 9, unsubscribeURL: URL(string: "https://support.google.com/accounts"), supportsOneClickPost: false, mailtoUnsubscribe: nil),
-        .init(id: "temu", name: "Temu", email: "temu@commerce.temumail.com", emailCount: 172, unsubscribeURL: URL(string: "https://www.temu.com"), supportsOneClickPost: false, mailtoUnsubscribe: nil),
-        .init(id: "stripe", name: "Stripe", email: "notifications@stripe.com", emailCount: 43, unsubscribeURL: URL(string: "https://stripe.com"), supportsOneClickPost: false, mailtoUnsubscribe: nil)
-    ]
-
-    private let previewCategories: [GmailCategorySummary] = [
-        .init(id: "Social", title: "Social Media", labelID: "CATEGORY_SOCIAL", messageCount: 18),
-        .init(id: "Promotions", title: "Promotions", labelID: "CATEGORY_PROMOTIONS", messageCount: 32),
-        .init(id: "Updates", title: "Updates", labelID: "CATEGORY_UPDATES", messageCount: 14),
-        .init(id: "Newsletters", title: "Forum", labelID: "CATEGORY_FORUMS", messageCount: 11),
-        .init(id: "Notifications", title: "Spam", labelID: "SPAM", messageCount: 7)
-    ]
-
     private let senderPalettes: [[Color]] = [
         [Color(hex: "#5FA5FF"), Color(hex: "#346CFF")],
         [Color(hex: "#8B7BFF"), Color(hex: "#5B46FF")],
@@ -66,12 +52,16 @@ struct EmailCleanerView: View {
         screenStack.last ?? .home
     }
 
+    /// Counts and lists are driven entirely by the live Gmail connection.
+    /// Before the user connects (or after they disconnect) we show a clean
+    /// zero state — no hardcoded demo data — so the numbers on the Email
+    /// Cleaner home always reflect reality.
     private var senders: [GmailSenderSummary] {
-        appFlow.isGmailConnected ? appFlow.gmailSenderSummaries : previewSenders
+        appFlow.isGmailConnected ? appFlow.gmailSenderSummaries : []
     }
 
     private var junkCategories: [GmailCategorySummary] {
-        appFlow.isGmailConnected ? appFlow.gmailCategorySummaries : previewCategories
+        appFlow.isGmailConnected ? appFlow.gmailCategorySummaries : []
     }
 
     private var currentCategory: GmailCategorySummary? {
@@ -104,6 +94,30 @@ struct EmailCleanerView: View {
 
     private var junkTotalCount: Int {
         junkCategories.reduce(0) { $0 + $1.messageCount }
+    }
+
+    private var unsubscribeSubtitle: String {
+        if appFlow.isGmailConnected {
+            return "Review noisy senders and keep or remove them fast."
+        }
+        return "Connect Gmail to see recurring senders."
+    }
+
+    private var junkMailSubtitle: String {
+        if appFlow.isGmailConnected {
+            return "Clean Social, Promotions, Updates, and Spam."
+        }
+        return "Connect Gmail to see junk-mail categories."
+    }
+
+    private var unsubscribeHint: String {
+        if appFlow.isGmailConnected { return "Scanning live Gmail senders..." }
+        return "Connect Gmail to see your recurring senders."
+    }
+
+    private var junkMailHint: String {
+        if appFlow.isGmailConnected { return "Use smart folders to get rid of junk mail." }
+        return "Connect Gmail to see your junk mail."
     }
 
     private var syncStatusText: String {
@@ -150,18 +164,14 @@ struct EmailCleanerView: View {
 
             entryCard(
                 title: "Unsubscribe",
-                subtitle: appFlow.isGmailConnected
-                    ? "Review noisy senders and keep or remove them fast."
-                    : "Preview recurring senders before linking Gmail.",
+                subtitle: unsubscribeSubtitle,
                 value: "\(unsubscribeAvailableCount)",
                 action: { push(.unsubscribe) }
             )
 
             entryCard(
                 title: "Junk Mail",
-                subtitle: appFlow.isGmailConnected
-                    ? "Clean Social, Promotions, Updates, and Spam."
-                    : "Pick the categories you want the cleaner to target.",
+                subtitle: junkMailSubtitle,
                 value: junkCategories.isEmpty ? "0" : formattedCount(junkTotalCount),
                 action: { push(.junkMail) }
             )
@@ -174,11 +184,7 @@ struct EmailCleanerView: View {
 
     private var unsubscribeContent: some View {
         VStack(alignment: .leading, spacing: 14) {
-            analysisHint(
-                appFlow.isGmailConnected
-                    ? "Scanning live Gmail senders..."
-                    : "Previewing the unsubscribe flow before Gmail is connected."
-            )
+            analysisHint(unsubscribeHint)
 
             if senders.isEmpty {
                 GlassCard(cornerRadius: 24) {
@@ -198,14 +204,23 @@ struct EmailCleanerView: View {
 
     private var junkMailContent: some View {
         VStack(alignment: .leading, spacing: 14) {
-            analysisHint(
-                appFlow.isGmailConnected
-                    ? "Use smart folders to get rid of junk mail."
-                    : "Previewing the junk-mail categories before Gmail is connected."
-            )
+            analysisHint(junkMailHint)
 
-            ForEach(junkCategories) { category in
-                junkCategoryRow(category)
+            if junkCategories.isEmpty {
+                GlassCard(cornerRadius: 24) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("No categories to show")
+                            .font(CleanupFont.sectionTitle(18))
+                            .foregroundStyle(.white)
+                        Text("Connect Gmail from the Email Cleaner home to see your junk-mail categories.")
+                            .font(CleanupFont.body(14))
+                            .foregroundStyle(CleanupTheme.textSecondary)
+                    }
+                }
+            } else {
+                ForEach(junkCategories) { category in
+                    junkCategoryRow(category)
+                }
             }
         }
     }
@@ -521,6 +536,7 @@ struct EmailCleanerView: View {
 
     private func deleteSelectedMessages() async {
         guard appFlow.isGmailConnected, !selectedMessageIDs.isEmpty else { return }
+        guard await MainActor.run(body: { appFlow.gateSingleAction(.emailCleanup) }) else { return }
         isDeletingMessages = true
 
         let ids = Array(selectedMessageIDs)

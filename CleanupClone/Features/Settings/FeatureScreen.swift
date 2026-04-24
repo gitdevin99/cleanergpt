@@ -41,15 +41,15 @@ struct FeatureScreen<TrailingContent: View, Content: View>: View {
             .padding(.horizontal, 16)
             .padding(.top, 10)
 
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 14) {
                 Text(title)
-                    .font(CleanupFont.hero(38))
+                    .font(CleanupFont.hero(30))
                     .foregroundStyle(.white)
                 content
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .padding(.horizontal, 16)
-            .padding(.top, 20)
+            .padding(.top, 12)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(

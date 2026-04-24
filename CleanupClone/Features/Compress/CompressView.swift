@@ -46,6 +46,7 @@ private enum CompressionStage {
 
 private struct CompressionRunSummary {
     let compressedCount: Int
+    let compressedBytes: Int64
     let savedBytes: Int64
     let originalsDeleted: Bool
     let deleteSucceeded: Bool
@@ -67,6 +68,9 @@ struct CompressView: View {
     @State private var showDeletePrompt = false
     @State private var runSummary: CompressionRunSummary?
     @State private var displayedAssetLimit = Self.assetPageSize
+    /// Local ID of the asset the user tapped to expand in the fullscreen
+    /// preview sheet. `nil` while the sheet is closed.
+    @State private var previewAssetID: String?
     @StateObject private var dragSelect = DragSelectState()
 
     /// Use cached arrays from AppFlow instead of recomputing on every render.
@@ -142,7 +146,7 @@ struct CompressView: View {
         ) {
             ZStack {
                 ScrollView(showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 10) {
                         if !appFlow.photoAuthorization.isReadable {
                             permissionCard
                         } else {
@@ -175,23 +179,71 @@ struct CompressView: View {
                     .padding(.top, 8)
             }
         }
+        // Fullscreen preview when the user taps the expand icon on a
+        // thumbnail. We reuse the same sheet the flat screenshot/video
+        // gallery uses so selection, swipe-to-clean, and the filmstrip
+        // all behave identically across the app.
+        .sheet(item: Binding(
+            get: { previewAssetID.map { VideoPreviewRoute(id: $0) } },
+            set: { previewAssetID = $0?.id }
+        )) { route in
+            VideoZoomPreviewSheet(
+                assets: visibleAssets,
+                initialAssetID: route.id,
+                selectedAssetIDs: $selectedAssetIDs,
+                accent: CleanupTheme.electricBlue
+            )
+            .environmentObject(appFlow)
+        }
         .onChange(of: selectedSection) { _, _ in
             selectedAssetIDs.removeAll()
             resetVisibleAssetWindow()
+            previewAssetID = nil
             if stage != .selection {
                 stage = .selection
             }
         }
+        .onChange(of: stage) { _, newStage in
+            if newStage != .selection {
+                previewAssetID = nil
+            }
+        }
         .task {
-            if appFlow.photoAuthorization.isReadable, appFlow.mediaAssets(for: .videos).isEmpty, appFlow.compressiblePhotoAssets().isEmpty {
-                await appFlow.scanLibrary()
+            // Only kick off a scan if we have NOTHING cached yet.
+            // `.firstLoad` is a hard no-op once the app has scanned
+            // the library at least once, which prevents the "went
+            // into Compress → everything re-indexed" footgun while
+            // Duplicates refinement is still running.
+            if appFlow.photoAuthorization.isReadable,
+               appFlow.mediaAssets(for: .videos).isEmpty,
+               appFlow.compressiblePhotoAssets().isEmpty {
+                await appFlow.scanLibrary(trigger: .firstLoad)
             }
             resetVisibleAssetWindow()
+        }
+        // Re-check permission state on return from background so the
+        // "Open Settings" card resolves itself after the user flips the
+        // toggle and comes back.
+        //
+        // IMPORTANT: we intentionally do NOT call `scanLibrary()` here
+        // anymore. `didBecomeActive` fires on every sheet/preview/
+        // system-dialog dismissal (permission prompts, share sheets,
+        // the PHAsset preview sheet, even just swiping down the
+        // Control Center). Wiring a scan to it meant every one of
+        // those innocuous events wiped the in-flight refinement state
+        // and re-ran the whole 30k-asset Vision pipeline. The photo
+        // library change observer picks up real library edits via
+        // `applyIncrementalPhotoLibraryChange`, so we don't need to
+        // rescan just because the app foregrounded.
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didBecomeActiveNotification
+        )) { _ in
+            appFlow.refreshPermissions()
         }
     }
 
     private var selectionContent: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 10) {
             summaryCard
             sectionPicker
             selectionSummaryCard
@@ -281,7 +333,7 @@ struct CompressView: View {
                     statRow(
                         title: "Compressed",
                         subtitle: "\(runSummary?.compressedCount ?? 0) item(s)",
-                        value: ByteCountFormatter.cleanupString(fromByteCount: compressedOutputBytes),
+                        value: ByteCountFormatter.cleanupString(fromByteCount: runSummary?.compressedBytes ?? 0),
                         tint: CleanupTheme.electricBlue
                     )
                     statRow(
@@ -308,39 +360,48 @@ struct CompressView: View {
     }
 
     private var summaryCard: some View {
-        GlassCard(cornerRadius: 24) {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Compress your media files")
-                    .font(CleanupFont.sectionTitle(24))
-                    .foregroundStyle(.white)
-
-                Text("\(visibleAssets.count) \(selectedSection.title.lowercased()) • \(ByteCountFormatter.cleanupString(fromByteCount: totalVisibleBytes))")
-                    .font(CleanupFont.body(18))
-                    .foregroundStyle(CleanupTheme.electricBlue)
-
-                Text("Potential savings: \(ByteCountFormatter.cleanupString(fromByteCount: totalVisibleEstimatedSavedBytes))")
-                    .font(CleanupFont.badge(13))
-                    .foregroundStyle(CleanupTheme.accentGreen)
-
+        GlassCard(cornerRadius: 18) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(visibleAssets.count) \(selectedSection.title.lowercased()) · \(ByteCountFormatter.cleanupString(fromByteCount: totalVisibleBytes))")
+                        .font(CleanupFont.body(14))
+                        .foregroundStyle(CleanupTheme.electricBlue)
+                    Text("Save up to \(ByteCountFormatter.cleanupString(fromByteCount: totalVisibleEstimatedSavedBytes))")
+                        .font(CleanupFont.badge(12))
+                        .foregroundStyle(CleanupTheme.accentGreen)
+                }
+                Spacer(minLength: 0)
                 if let message = appFlow.compressionMessage {
                     Text(message)
-                        .font(CleanupFont.caption(12))
+                        .font(CleanupFont.caption(11))
                         .foregroundStyle(CleanupTheme.textSecondary)
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(2)
                 }
             }
         }
     }
 
     private var permissionCard: some View {
-        GlassCard(cornerRadius: 24) {
+        // See DashboardView.permissionCard for why we branch on
+        // `needsSettingsRedirect`: iOS won't re-show the system prompt
+        // after a user has denied access, so the "Allow Photos Access"
+        // button silently no-ops until we route to Settings instead.
+        let deniedPath = appFlow.photoAuthorization.needsSettingsRedirect
+
+        return GlassCard(cornerRadius: 24) {
             VStack(alignment: .leading, spacing: 14) {
-                Text("Photo access is required to compress files.")
+                Text(deniedPath
+                    ? "Photo access was turned off. Open Settings to turn it back on so we can compress your files."
+                    : "Photo access is required to compress files.")
                     .font(CleanupFont.body(16))
                     .foregroundStyle(.white)
 
-                PrimaryCTAButton(title: "Allow Photos Access") {
-                    Task {
-                        _ = await appFlow.requestPhotoAccessIfNeeded()
+                PrimaryCTAButton(title: deniedPath ? "Open Settings" : "Allow Photos Access") {
+                    if deniedPath {
+                        appFlow.openSystemSettings()
+                    } else {
+                        Task { _ = await appFlow.requestPhotoAccessIfNeeded() }
                     }
                 }
             }
@@ -370,21 +431,23 @@ struct CompressView: View {
     }
 
     private var selectionSummaryCard: some View {
-        GlassCard(cornerRadius: 20) {
+        GlassCard(cornerRadius: 16) {
             HStack {
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text(selectedAssets.isEmpty ? "Choose your \(selectedSection.title.lowercased())" : "\(selectedAssets.count) \(selectionUnitLabel()) selected")
-                        .font(CleanupFont.body(16))
+                        .font(CleanupFont.body(14))
                         .foregroundStyle(.white)
-                    Text(selectedAssets.isEmpty ? "Select one or multiple items first." : "Selected size \(ByteCountFormatter.cleanupString(fromByteCount: selectedAssets.reduce(0) { $0 + $1.sizeInBytes }))")
-                        .font(CleanupFont.caption(12))
-                        .foregroundStyle(CleanupTheme.textSecondary)
+                    if !selectedAssets.isEmpty {
+                        Text(ByteCountFormatter.cleanupString(fromByteCount: selectedAssets.reduce(0) { $0 + $1.sizeInBytes }))
+                            .font(CleanupFont.caption(11))
+                            .foregroundStyle(CleanupTheme.textSecondary)
+                    }
                 }
 
                 Spacer()
 
                 Text(ByteCountFormatter.cleanupString(fromByteCount: estimatedSavedBytes))
-                    .font(CleanupFont.sectionTitle(20))
+                    .font(CleanupFont.sectionTitle(17))
                     .foregroundStyle(CleanupTheme.electricBlue)
             }
         }
@@ -410,9 +473,17 @@ struct CompressView: View {
                 dragSelect.cellFrames = frames
             }
             .simultaneousGesture(
-                DragGesture(minimumDistance: 12, coordinateSpace: .named("compressGrid"))
+                // Higher minimumDistance so light touches/vertical scrolls don't
+                // fire drag-select. 40pt matches Photos.app's drag threshold.
+                DragGesture(minimumDistance: 40, coordinateSpace: .named("compressGrid"))
                     .onChanged { value in
+                        // Only engage drag-select when the gesture is clearly
+                        // horizontal/diagonal — vertical-dominant drags belong
+                        // to the ScrollView.
+                        let dx = abs(value.translation.width)
+                        let dy = abs(value.translation.height)
                         if !dragSelect.isDragging {
+                            guard dx > dy * 0.6 else { return }
                             dragSelect.orderedIDs = paged.map(\.id)
                             dragSelect.dragBegan(at: value.startLocation, currentSelection: selectedAssetIDs)
                         }
@@ -426,7 +497,6 @@ struct CompressView: View {
                         }
                     }
             )
-            .drawingGroup()
 
             if hasMoreVisibleAssets {
                 HStack(spacing: 10) {
@@ -446,12 +516,31 @@ struct CompressView: View {
     @ViewBuilder
     private func compressAssetCell(_ asset: MediaAssetRecord) -> some View {
         let isSelected = selectedAssetIDs.contains(asset.id)
-        Button {
-            toggleSelection(for: asset.id)
-        } label: {
+        // Use a ZStack + tap gesture on the card body so we can layer a
+        // separate "expand" button on top without the two fighting the
+        // hit-testing rules of nested SwiftUI Buttons. The card itself
+        // still toggles selection; the overlay button opens the
+        // fullscreen preview sheet.
+        ZStack(alignment: .topLeading) {
             compressAssetCardContent(asset, isSelected: isSelected)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    toggleSelection(for: asset.id)
+                }
+
+            Button {
+                previewAssetID = asset.id
+            } label: {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 28, height: 28)
+                    .background(Color.black.opacity(0.55), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .padding(10)
+            .accessibilityLabel("Preview")
         }
-        .buttonStyle(.plain)
     }
 
     private var floatingSelectionButton: some View {
@@ -556,6 +645,11 @@ struct CompressView: View {
 
     private var qualityActionButton: some View {
         GlassProminentCTA {
+            if !EntitlementStore.shared.isPremium,
+               EntitlementStore.shared.remaining(.videoCompress) == 0 {
+                appFlow.requestUpgrade(for: .videoCompress)
+                return
+            }
             showDeletePrompt = true
         } label: {
             Text(qualityButtonTitle)
@@ -642,43 +736,40 @@ struct CompressView: View {
     private func compressAssetCardContent(_ asset: MediaAssetRecord, isSelected: Bool) -> some View {
         let estimate = max(0, asset.sizeInBytes - estimatedCompressedBytes(for: asset))
 
-        return GlassCard(cornerRadius: 24) {
-            VStack(alignment: .leading, spacing: 10) {
+        return GlassCard(cornerRadius: 20) {
+            VStack(alignment: .leading, spacing: 6) {
                 ZStack(alignment: .topTrailing) {
                     PhotoThumbnailView(localIdentifier: asset.id)
                         .frame(maxWidth: .infinity)
                         .aspectRatio(1, contentMode: .fill)
-                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .font(.system(size: 22, weight: .bold))
                         .foregroundStyle(isSelected ? CleanupTheme.electricBlue : .white.opacity(0.82))
-                        .padding(10)
+                        .padding(8)
                 }
 
-                if let result = appFlow.compressionResults[asset.id] {
-                    ResultBadge(title: "Saved \(ByteCountFormatter.cleanupString(fromByteCount: result.savedBytes))", tint: CleanupTheme.accentGreen)
-                } else {
-                    ResultBadge(title: "Save \(ByteCountFormatter.cleanupString(fromByteCount: estimate))", tint: CleanupTheme.electricBlue)
-                }
-
-                Text(asset.title)
-                    .font(CleanupFont.body(15))
-                    .foregroundStyle(.white)
-                    .lineLimit(2)
-
-                Text(asset.detailLine)
-                    .font(CleanupFont.caption(12))
-                    .foregroundStyle(CleanupTheme.textSecondary)
-
-                HStack {
-                    Text("Original \(asset.formattedSize)")
-                        .font(CleanupFont.caption(12))
+                HStack(spacing: 6) {
+                    Text(asset.formattedSize)
+                        .font(CleanupFont.caption(11))
                         .foregroundStyle(CleanupTheme.textSecondary)
-                    Spacer()
-                    Text(appFlow.compressionResults[asset.id].map { "Now \(ByteCountFormatter.cleanupString(fromByteCount: $0.compressedBytes))" } ?? "After \(ByteCountFormatter.cleanupString(fromByteCount: estimatedCompressedBytes(for: asset)))")
-                        .font(CleanupFont.caption(12))
-                        .foregroundStyle(.white.opacity(0.72))
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(CleanupTheme.textSecondary)
+                    Text(appFlow.compressionResults[asset.id].map { ByteCountFormatter.cleanupString(fromByteCount: $0.compressedBytes) } ?? ByteCountFormatter.cleanupString(fromByteCount: estimatedCompressedBytes(for: asset)))
+                        .font(CleanupFont.caption(11))
+                        .foregroundStyle(.white.opacity(0.85))
+                    Spacer(minLength: 0)
+                    if let result = appFlow.compressionResults[asset.id] {
+                        Text("−\(ByteCountFormatter.cleanupString(fromByteCount: result.savedBytes))")
+                            .font(CleanupFont.badge(11))
+                            .foregroundStyle(CleanupTheme.accentGreen)
+                    } else {
+                        Text("−\(ByteCountFormatter.cleanupString(fromByteCount: estimate))")
+                            .font(CleanupFont.badge(11))
+                            .foregroundStyle(CleanupTheme.electricBlue)
+                    }
                 }
             }
         }
@@ -732,7 +823,8 @@ struct CompressView: View {
     private func handleTrailingAction() {
         switch stage {
         case .selection:
-            Task { await appFlow.scanLibrary() }
+            // Top-right refresh button — user-initiated, always runs.
+            Task { await appFlow.scanLibrary(trigger: .manual) }
         case .quality, .success:
             stage = .selection
         case .processing:
@@ -832,11 +924,22 @@ struct CompressView: View {
 
     private func runCompression(deleteOriginals: Bool) async {
         guard !selectedAssets.isEmpty else { return }
+
+        let requested = selectedAssets.count
+        let allowed = await MainActor.run { () -> Int in
+            appFlow.consumeFreeAllowance(.videoCompress, requested: requested)
+        }
+        guard allowed > 0 else {
+            stage = .selection
+            return
+        }
+
         isRunningBatch = true
 
-        let assetsToCompress = selectedAssets
+        let assetsToCompress = Array(selectedAssets.prefix(allowed))
         var successfulIDs: [String] = []
         var savedBytes: Int64 = 0
+        var compressedBytes: Int64 = 0
 
         for asset in assetsToCompress {
             let success: Bool
@@ -860,6 +963,7 @@ struct CompressView: View {
             if success, let result = appFlow.compressionResults[asset.id] {
                 successfulIDs.append(asset.id)
                 savedBytes += result.savedBytes
+                compressedBytes += result.compressedBytes
             }
         }
 
@@ -870,6 +974,7 @@ struct CompressView: View {
 
         runSummary = CompressionRunSummary(
             compressedCount: successfulIDs.count,
+            compressedBytes: compressedBytes,
             savedBytes: deleteOriginals && deleteSucceeded ? savedBytes : 0,
             originalsDeleted: deleteOriginals,
             deleteSucceeded: deleteSucceeded

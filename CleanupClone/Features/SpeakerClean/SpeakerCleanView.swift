@@ -363,7 +363,16 @@ struct SpeakerCleanView: View {
     // MARK: - Actions
 
     private func startCleaning() {
-        timeRemaining = duration.rawValue
+        let isPremium = EntitlementStore.shared.isPremium
+        if !isPremium {
+            if !EntitlementStore.shared.canUse(.speakerClean) {
+                appFlow.requestUpgrade(for: .speakerClean)
+                return
+            }
+            EntitlementStore.shared.recordUse(.speakerClean)
+        }
+        let cap = isPremium ? duration.rawValue : min(5, duration.rawValue)
+        timeRemaining = cap
         withAnimation(.easeInOut(duration: 0.3)) {
             phase = .active
         }
@@ -382,6 +391,9 @@ struct SpeakerCleanView: View {
                 timer.invalidate()
                 if phase == .active {
                     stopCleaning()
+                    if !isPremium {
+                        appFlow.requestUpgrade(for: .speakerClean)
+                    }
                 }
             }
         }
@@ -396,197 +408,26 @@ struct SpeakerCleanView: View {
 }
 
 // MARK: - Audio + Haptics Engine (Core Haptics for maximum vibration)
+//
+// Thin wrapper around `SharedToneEngine` so the in-app SpeakerCleanView and
+// the widget-triggered App Intents drive the SAME audio + haptics pipeline.
+// Behaviour is identical to the original implementation — just centralised.
 
 @MainActor
 final class SpeakerCleanEngine: ObservableObject {
-    private var audioEngine: AVAudioEngine?
-    private var playerNode: AVAudioPlayerNode?
-
-    // Core Haptics — continuous vibration at maximum intensity
-    private var hapticEngine: CHHapticEngine?
-    private var hapticPlayer: CHHapticAdvancedPatternPlayer?
-
-    // Fallback for devices without Core Haptics
-    private var fallbackTimer: Timer?
-    private let heavyGenerator = UIImpactFeedbackGenerator(style: .heavy)
+    private let shared = SharedToneEngine.shared
 
     func startTone(frequency: Float, mode: SpeakerCleanView.CleanMode) {
-        stop()
-
-        // ── 1. Audio: sine wave tone through speaker ──
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [])
-            try session.setActive(true)
-        } catch {
-            // Continue anyway — haptics still work
-        }
-
-        let engine = AVAudioEngine()
-        let player = AVAudioPlayerNode()
-        engine.attach(player)
-
-        let sampleRate: Double = 44100
-        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
-        engine.connect(player, to: engine.mainMixerNode, format: format)
-
-        let bufferLength = AVAudioFrameCount(sampleRate * 2)
-        if let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: bufferLength) {
-            buffer.frameLength = bufferLength
-            let data = buffer.floatChannelData![0]
-
-            if mode == .dust {
-                // Frequency sweep 150–300 Hz for dust shaking
-                for i in 0..<Int(bufferLength) {
-                    let t = Float(i) / Float(sampleRate)
-                    let sweep = frequency + 150 * sin(2 * .pi * 0.5 * t)
-                    data[i] = sin(2 * .pi * sweep * t)
-                }
-            } else {
-                // Steady 165 Hz bass tone for water ejection
-                for i in 0..<Int(bufferLength) {
-                    let t = Float(i) / Float(sampleRate)
-                    data[i] = sin(2 * .pi * frequency * t)
-                }
-            }
-
-            do {
-                try engine.start()
-                player.play()
-                player.scheduleBuffer(buffer, at: nil, options: .loops)
-            } catch { /* audio failed, haptics still run */ }
-        }
-
-        self.audioEngine = engine
-        self.playerNode = player
-
-        // ── 2. Core Haptics: MAXIMUM continuous vibration ──
-        startCoreHaptics(mode: mode)
-    }
-
-    /// Uses Core Haptics to deliver the strongest, most sustained vibration iOS allows.
-    /// CHHapticEngine supports continuous events at intensity 1.0 + sharpness 1.0 —
-    /// this is the absolute maximum vibration available on iPhone.
-    private func startCoreHaptics(mode: SpeakerCleanView.CleanMode) {
-        guard CHHapticEngine.capabilitiesForHardware().supportsHaptics else {
-            // Device doesn't support Core Haptics — fall back to rapid impact taps
-            startFallbackHaptics(mode: mode)
-            return
-        }
-
-        do {
-            let engine = try CHHapticEngine()
-            engine.playsHapticsOnly = true
-            engine.isAutoShutdownEnabled = false
-
-            // If the engine stops unexpectedly, restart it
-            engine.stoppedHandler = { [weak self] reason in
-                Task { @MainActor in
-                    try? self?.hapticEngine?.start()
-                }
-            }
-            engine.resetHandler = { [weak self] in
-                Task { @MainActor in
-                    try? self?.hapticEngine?.start()
-                }
-            }
-
-            try engine.start()
-            self.hapticEngine = engine
-
-            // Build a long continuous haptic pattern at MAX intensity
-            // Core Haptics continuous events can last up to 30s per event
-            // We chain multiple events to cover the full duration
-
-            var events: [CHHapticEvent] = []
-            let totalDuration: TimeInterval = 65 // cover max 60s + buffer
-            let chunkDuration: TimeInterval = 5  // 5-second continuous chunks
-
-            var t: TimeInterval = 0
-            while t < totalDuration {
-                let segmentLength = min(chunkDuration, totalDuration - t)
-
-                if mode == .dust {
-                    // Dust: continuous strong vibration with high sharpness (buzzy, rattling feel)
-                    let intensity = CHHapticEventParameter(parameterID: .hapticIntensity, value: 1.0)
-                    let sharpness = CHHapticEventParameter(parameterID: .hapticSharpness, value: 1.0)
-                    let event = CHHapticEvent(
-                        eventType: .hapticContinuous,
-                        parameters: [intensity, sharpness],
-                        relativeTime: t,
-                        duration: segmentLength
-                    )
-                    events.append(event)
-                } else {
-                    // Water: continuous deep vibration with low sharpness (deep rumble, like bass)
-                    let intensity = CHHapticEventParameter(parameterID: .hapticIntensity, value: 1.0)
-                    let sharpness = CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.0)
-                    let event = CHHapticEvent(
-                        eventType: .hapticContinuous,
-                        parameters: [intensity, sharpness],
-                        relativeTime: t,
-                        duration: segmentLength
-                    )
-                    events.append(event)
-
-                    // Layer transient "kicks" every 0.1s on top for extra punch
-                    var kickTime = t
-                    while kickTime < t + segmentLength {
-                        let kickIntensity = CHHapticEventParameter(parameterID: .hapticIntensity, value: 1.0)
-                        let kickSharpness = CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.5)
-                        let kick = CHHapticEvent(
-                            eventType: .hapticTransient,
-                            parameters: [kickIntensity, kickSharpness],
-                            relativeTime: kickTime
-                        )
-                        events.append(kick)
-                        kickTime += 0.1
-                    }
-                }
-
-                t += chunkDuration
-            }
-
-            let pattern = try CHHapticPattern(events: events, parameters: [])
-            let player = try engine.makeAdvancedPlayer(with: pattern)
-            player.loopEnabled = true
-            try player.start(atTime: CHHapticTimeImmediate)
-            self.hapticPlayer = player
-
-        } catch {
-            // Core Haptics failed — fall back
-            startFallbackHaptics(mode: mode)
-        }
-    }
-
-    /// Fallback: rapid UIImpactFeedbackGenerator taps (weaker than Core Haptics)
-    private func startFallbackHaptics(mode: SpeakerCleanView.CleanMode) {
-        heavyGenerator.prepare()
-        // Fire heavy impacts as fast as possible
-        fallbackTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.heavyGenerator.impactOccurred(intensity: 1.0)
-            }
-        }
+        // `frequency` kept in the signature for compatibility with the
+        // existing call site; SharedToneEngine hard-codes 165 Hz water /
+        // 1–6 kHz dust sweep (same values as before).
+        _ = frequency
+        let mappedMode: SharedToneEngine.Mode = (mode == .water) ? .water : .dust
+        shared.start(mode: mappedMode, seconds: nil)
     }
 
     func stop() {
-        // Stop haptics
-        try? hapticPlayer?.stop(atTime: CHHapticTimeImmediate)
-        hapticPlayer = nil
-        hapticEngine?.stop()
-        hapticEngine = nil
-
-        fallbackTimer?.invalidate()
-        fallbackTimer = nil
-
-        // Stop audio
-        playerNode?.stop()
-        audioEngine?.stop()
-        audioEngine = nil
-        playerNode = nil
-
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        shared.stop()
     }
 }
 
