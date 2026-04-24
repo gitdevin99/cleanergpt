@@ -1641,9 +1641,9 @@ private struct SocialProofStep: View {
         ),
         Testimonial(
             avatar: .image("TestimonialRobert"),
-            name: "Robert T.", subtitle: "Retired · age 68",
+            name: "Robert T.", subtitle: "Brooklyn · product designer",
             stars: 5,
-            quote: "I’m not great with tech but my grandson set it up for me. It kept telling me my storage was full and this just… fixed it. Thank you."
+            quote: "Finally stopped getting that ‘storage full’ popup mid-screenshot. Cleared 22 GB in one sitting and didn’t have to babysit it — just tapped clean and went back to my day."
         ),
         Testimonial(
             avatar: .image("TestimonialMarcus"),
