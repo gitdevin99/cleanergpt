@@ -1640,7 +1640,7 @@ private struct SocialProofStep: View {
             quote: "Cleared 38 GB in an afternoon — years of duplicate screenshots I didn’t even know I had. My phone actually breathes now."
         ),
         Testimonial(
-            avatar: .initials("RT", [Color(hex: "#FF8C42"), Color(hex: "#B83C3C")]),
+            avatar: .image("TestimonialRobert"),
             name: "Robert T.", subtitle: "Retired · age 68",
             stars: 5,
             quote: "I’m not great with tech but my grandson set it up for me. It kept telling me my storage was full and this just… fixed it. Thank you."
@@ -1652,7 +1652,7 @@ private struct SocialProofStep: View {
             quote: "The similar-shots finder is uncanny. I shoot in bursts all day — it keeps the best frame and bins the rest, exactly how I’d do it manually."
         ),
         Testimonial(
-            avatar: .initials("MP", [Color(hex: "#3FA9FF"), Color(hex: "#123E66")]),
+            avatar: .image("TestimonialMei"),
             name: "Mei P.", subtitle: "Singapore",
             stars: 5,
             quote: "Dropped my phone in the pool — the speaker sounded blown. Ran the water-eject for 30 seconds and it came right back. I was ready to buy a new one."
@@ -1664,7 +1664,7 @@ private struct SocialProofStep: View {
             quote: "Way better than paying Apple £2.99 a month for more iCloud. Paid once, fixed the actual problem. Wish I’d found it a year ago."
         ),
         Testimonial(
-            avatar: .initials("DA", [Color(hex: "#7DFF99"), Color(hex: "#1E5F3C")]),
+            avatar: .image("TestimonialDiego"),
             name: "Diego A.", subtitle: "Madrid · age 54",
             stars: 5,
             quote: "Merged 400+ duplicate contacts in one tap. My address book was a mess after switching phones three times. Genuinely useful — not another junk cleaner."
