@@ -1464,9 +1464,29 @@ final class AppFlow: ObservableObject {
         refiningClusterCategories.insert(.duplicates)
         defer { refiningClusterCategories.remove(.duplicates) }
 
+        // DEBUG LOGS — remove once duplicate detection is verified on
+        // multiple devices. These show (a) how many candidate buckets
+        // arrived, (b) how many have >1 members (the only ones we
+        // actually fingerprint), and (c) the distribution so we can
+        // tell whether "0 duplicates" means "no candidates" vs
+        // "candidates existed but all fingerprints mismatched".
+        print("[DUP] verifyDuplicatesByPixel called with \(candidateBuckets.count) candidate buckets")
+        let bucketMemberCounts = candidateBuckets.values.map(\.count)
+        let totalCandidates = bucketMemberCounts.reduce(0, +)
+        let multiMemberBuckets = bucketMemberCounts.filter { $0 > 1 }.count
+        print("[DUP]   total candidate records: \(totalCandidates)")
+        print("[DUP]   buckets with >1 member: \(multiMemberBuckets)")
+        if multiMemberBuckets > 0 {
+            let previewKeys = candidateBuckets.filter { $0.value.count > 1 }.prefix(5)
+            for (key, members) in previewKeys {
+                print("[DUP]   bucket key='\(key)' count=\(members.count) ids=\(members.prefix(3).map(\.id))")
+            }
+        }
+
         // Only care about candidate buckets with ≥2 members.
         let interesting = candidateBuckets.values.filter { $0.count > 1 }
         guard !interesting.isEmpty else {
+            print("[DUP] no interesting buckets (every bucket has ≤1 member) — writing empty duplicates")
             mediaClustersByCategory[.duplicates] = []
             mediaAssetsByCategory[.duplicates] = []
             refreshDashboardCategories()
@@ -1534,10 +1554,19 @@ final class AppFlow: ObservableObject {
             // Group by fingerprint. Assets whose fingerprint couldn't
             // be computed are dropped (we'd rather skip than misgroup).
             var byPrint: [Data: [MediaAssetRecord]] = [:]
+            var nilFingerprints = 0
             for (record, print) in fingerprints {
-                guard let print else { continue }
+                guard let print else { nilFingerprints += 1; continue }
                 byPrint[print, default: []].append(record)
             }
+            // DEBUG LOG — per candidate bucket, show how many unique
+            // fingerprints came back and how many matches we found.
+            // If "candidates=N distinct=N" we know fingerprints all
+            // differed → no duplicates for that bucket. If
+            // "candidates=N distinct=1" we know they all matched →
+            // one duplicate cluster coming up.
+            let matchingGroups = byPrint.values.filter { $0.count > 1 }.count
+            print("[DUP]   bucket #\(candidateIndex): candidates=\(fingerprints.count) nilFingerprints=\(nilFingerprints) distinct=\(byPrint.count) matchingGroups=\(matchingGroups)")
 
             for (printIndex, (_, records)) in byPrint.enumerated() where records.count > 1 {
                 let sorted = records.sorted {
@@ -1574,6 +1603,9 @@ final class AppFlow: ObservableObject {
             return $0.sizeInBytes > $1.sizeInBytes
         }
         refreshDashboardCategories()
+
+        // DEBUG LOG — final duplicate-pass outcome.
+        print("[DUP] verifyDuplicatesByPixel DONE: \(verifiedClusters.count) verified cluster(s), \(mediaAssetsByCategory[.duplicates]?.count ?? 0) total duplicate records")
 
         // Duplicates are populated in this second pass; without a
         // re-save the on-disk snapshot would restore with an empty
@@ -2397,6 +2429,12 @@ final class AppFlow: ObservableObject {
                 let duplicateKey = "\(meta.mediaType.rawValue)-\(meta.pixelWidth)x\(meta.pixelHeight)-\(size)"
                 duplicateBuckets[duplicateKey, default: []].append(record)
                 dupKey = duplicateKey
+                // DEBUG LOG — routeFromMeta (full-scan path). Only
+                // logs one per 500 records to avoid flooding the
+                // Xcode console on a 37K-asset scan.
+                if duplicateBuckets[duplicateKey]?.count ?? 0 > 1 {
+                    print("[DUP-ROUTE] full-scan dupKey='\(duplicateKey)' bucketSize=\(duplicateBuckets[duplicateKey]?.count ?? 0) id=\(record.id)")
+                }
 
                 let similarKey = "\(Int(ts / 180))-\(w48)-\(h48)-\(areaBucket)"
                 similarBuckets[similarKey, default: []].append(record)
@@ -2488,6 +2526,12 @@ final class AppFlow: ObservableObject {
                 let duplicateKey = duplicateCandidateKey(for: asset, size: record.sizeInBytes)
                 duplicateBuckets[duplicateKey, default: []].append(record)
                 dupKey = duplicateKey
+                // DEBUG LOG — routeAsset (incremental / delta path).
+                // If two identical new photos produce DIFFERENT
+                // duplicateKeys, that's our bug: the size differs
+                // because estimatedFileSize returned different values
+                // for them.
+                print("[DUP-ROUTE] routeAsset id=\(record.id) size=\(record.sizeInBytes) dupKey='\(duplicateKey)'")
 
                 let similarKey = similarPhotoKey(for: asset)
                 similarBuckets[similarKey, default: []].append(record)
@@ -4247,6 +4291,10 @@ final class AppFlow: ObservableObject {
             return cached
         }
         guard let sourceAsset = assetForLookupIdentifier(asset.id) else {
+            // DEBUG LOG — we couldn't resolve a PHAsset for this ID.
+            // That would silently drop the record from duplicate
+            // verification.
+            print("[DUP-FP] pixelFingerprint: no PHAsset found for id=\(asset.id)")
             return nil
         }
 
@@ -4260,15 +4308,24 @@ final class AppFlow: ObservableObject {
         let assetID = asset.id
         let fingerprint: Data? = await Task.detached(priority: .utility) {
             guard let thumbnail = await Self.requestIndexingThumbnail(for: sourceAsset) else {
+                print("[DUP-FP] requestIndexingThumbnail returned nil for id=\(assetID)")
                 return nil
             }
             return Self.makePixelFingerprint(from: thumbnail.uiImage)
         }.value
 
         if let fingerprint {
+            // DEBUG LOG — first 8 bytes of the fingerprint so we can
+            // eyeball whether two "identical" photos actually produced
+            // matching hashes. If the prefixes differ, they won't
+            // group; if they match, they will.
+            let prefix = fingerprint.prefix(8).map { String(format: "%02x", $0) }.joined()
+            print("[DUP-FP] fingerprint id=\(assetID) prefix=\(prefix)")
             // Hop back to main actor only for the cache write — this
             // closure is implicitly on `@MainActor` because AppFlow is.
             pixelFingerprintCache[assetID] = fingerprint
+        } else {
+            print("[DUP-FP] makePixelFingerprint returned nil for id=\(assetID)")
         }
         return fingerprint
     }
