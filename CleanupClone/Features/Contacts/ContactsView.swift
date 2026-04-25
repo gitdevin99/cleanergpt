@@ -86,27 +86,51 @@ private struct ContactsMainScreen: View {
                 await appFlow.scanContacts()
             }
         }
+        // When the user goes to iOS Settings to flip Contacts access
+        // on and comes back, didBecomeActive fires. Refresh the cached
+        // permission status and kick off the first scan automatically
+        // so they don't have to tap anything else.
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didBecomeActiveNotification
+        )) { _ in
+            appFlow.refreshPermissions()
+            if appFlow.contactsAuthorization.isReadable, appFlow.allContacts.isEmpty {
+                Task { await appFlow.scanContacts() }
+            }
+        }
     }
 
     private var permissionCard: some View {
-        GlassCard(cornerRadius: 24) {
+        // Two-state CTA, same pattern as Photos / Calendar:
+        //   • notDetermined  → "Continue" (fires the system prompt).
+        //   • denied / restricted → "Open Settings" (deep-link into
+        //     iOS Settings; iOS will not re-show the permission alert
+        //     once it's been denied, so a "Continue" button at that
+        //     point would silently no-op forever — exactly the bug
+        //     the user hit).
+        // Apple guideline 5.1.1(iv): pre-prompt button copy must be
+        // neutral, not action-claim language like "Allow Contacts
+        // Access". The body text above conveys what the access is for.
+        let deniedPath = appFlow.contactsAuthorization.needsSettingsRedirect
+        return GlassCard(cornerRadius: 24) {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Need access to start scanning")
+                Text(deniedPath ? "Turn on contacts access" : "Need access to start scanning")
                     .font(CleanupFont.sectionTitle(24))
                     .foregroundStyle(.white)
 
-                Text("Scan your address book, group duplicates, and keep the strongest card.")
+                Text(deniedPath
+                     ? "Contacts access was turned off. Open Settings to turn it back on so we can scan your address book, group duplicates, and keep the strongest card."
+                     : "Scan your address book, group duplicates, and keep the strongest card.")
                     .font(CleanupFont.body(14))
                     .foregroundStyle(CleanupTheme.textSecondary)
 
-                // Apple guideline 5.1.1(iv): the CTA leading directly
-                // into a system permission prompt must use neutral
-                // copy like "Continue", not action-claim phrases like
-                // "Allow Contacts Access". The explainer text above
-                // still tells the user what we do with access.
-                PrimaryCTAButton(title: "Continue") {
-                    Task {
-                        _ = await appFlow.requestContactsAccessIfNeeded()
+                PrimaryCTAButton(title: deniedPath ? "Open Settings" : "Continue") {
+                    if deniedPath {
+                        appFlow.openSystemSettings()
+                    } else {
+                        Task {
+                            _ = await appFlow.requestContactsAccessIfNeeded()
+                        }
                     }
                 }
             }

@@ -5826,6 +5826,18 @@ extension CNAuthorizationStatus {
     var isReadable: Bool {
         self == .authorized
     }
+
+    /// True when iOS will NOT re-show the contacts permission prompt
+    /// because the user already denied (or MDM restricted) it. Same
+    /// pattern as PHAuthorizationStatus / EKAuthorizationStatus —
+    /// the only path back to "authorized" is a deep link into iOS
+    /// Settings → <App> → Contacts. UI uses this to swap the
+    /// permission CTA from a system-prompt trigger to an
+    /// Open-Settings deep link, since otherwise tapping the same
+    /// button after a denial just silently no-ops.
+    var needsSettingsRedirect: Bool {
+        self == .denied || self == .restricted
+    }
 }
 
 extension EKAuthorizationStatus {
