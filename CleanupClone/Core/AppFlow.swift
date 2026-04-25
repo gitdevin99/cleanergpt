@@ -5839,6 +5839,21 @@ extension EKAuthorizationStatus {
             return false
         }
     }
+
+    /// True when iOS will NOT re-show the calendar permission prompt
+    /// because the user already denied (or MDM restricted) it. The
+    /// only path back to "authorized" is a deep link into iOS
+    /// Settings → <App> → Calendars. UI checks this to swap the
+    /// permission CTA from a system-prompt trigger to an
+    /// Open-Settings deep link.
+    var needsSettingsRedirect: Bool {
+        switch self {
+        case .denied, .restricted:
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 private struct ClusterMember {

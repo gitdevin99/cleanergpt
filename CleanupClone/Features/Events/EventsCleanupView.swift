@@ -89,6 +89,18 @@ struct EventsCleanupView: View {
                 await appFlow.scanEvents()
             }
         }
+        // When the user goes to iOS Settings to flip Calendar access on
+        // and comes back, didBecomeActive fires. Refresh the cached
+        // permission status and kick off the first scan automatically
+        // so they don't have to tap anything else.
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didBecomeActiveNotification
+        )) { _ in
+            appFlow.refreshPermissions()
+            if appFlow.eventsAuthorization.isReadable, appFlow.pastEvents.isEmpty {
+                Task { await appFlow.scanEvents() }
+            }
+        }
         .alert("Events cleanup", isPresented: $showResult) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -99,23 +111,39 @@ struct EventsCleanupView: View {
     // MARK: - States
 
     private var permissionGate: some View {
-        VStack(spacing: 16) {
+        // Two-state CTA, matching the Photos / Contacts cards:
+        //   • notDetermined  → "Continue" (fires the system prompt).
+        //   • denied / restricted → "Open Settings" (deep-link into
+        //     iOS Settings; iOS will not re-show the prompt once
+        //     denied, so a button that retries the request would
+        //     just silently no-op — exactly the bug the user hit).
+        // Apple guideline 5.1.1(iv): pre-prompt button must be
+        // neutral wording, never "Allow access". Explanation text
+        // above the button still conveys what we'll do.
+        let deniedPath = appFlow.eventsAuthorization.needsSettingsRedirect
+        return VStack(spacing: 16) {
             Spacer(minLength: 40)
             Image(systemName: "calendar.badge.exclamationmark")
                 .font(.system(size: 44, weight: .semibold))
                 .foregroundStyle(CleanupTheme.electricBlue)
-            Text("Calendar access needed")
+            Text(deniedPath ? "Turn on calendar access" : "Calendar access needed")
                 .font(CleanupFont.sectionTitle(20))
                 .foregroundStyle(.white)
-            Text("Cleanup needs calendar access to find old events you can safely remove. Your events never leave your device.")
+            Text(deniedPath
+                 ? "Calendar access was turned off. Open Settings to turn it back on so we can find old events you can safely remove. Your events never leave your device."
+                 : "Cleanup needs calendar access to find old events you can safely remove. Your events never leave your device.")
                 .font(CleanupFont.body(14))
                 .foregroundStyle(CleanupTheme.textSecondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 20)
             Button {
-                Task { _ = await appFlow.requestEventsAccessIfNeeded() }
+                if deniedPath {
+                    appFlow.openSystemSettings()
+                } else {
+                    Task { _ = await appFlow.requestEventsAccessIfNeeded() }
+                }
             } label: {
-                Text("Allow access")
+                Text(deniedPath ? "Open Settings" : "Continue")
                     .font(CleanupFont.body(16))
                     .foregroundStyle(.white)
                     .frame(maxWidth: .infinity)
