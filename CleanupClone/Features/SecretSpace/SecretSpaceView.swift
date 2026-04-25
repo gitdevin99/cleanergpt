@@ -571,6 +571,7 @@ struct SecretSpaceView: View {
             statusMessage = nil
             creationPhase = .confirm
         case .confirm:
+            print("[PIN-VIEW] confirm step — newPIN=\"\(newPIN)\" confirmPIN=\"\(confirmPIN)\" match=\(confirmPIN == newPIN) recoveryMode=\(isResettingPINViaBiometrics)")
             if confirmPIN == newPIN {
                 // During Face-ID-backed recovery we REPLACE the hash
                 // without touching the vault directory or the items
@@ -629,6 +630,8 @@ struct SecretSpaceView: View {
             value: $unlockPIN,
             maxLength: 4,
             onComplete: {
+                let attempted = unlockPIN
+                print("[PIN-VIEW] unlock onComplete fired — unlockPIN=\"\(attempted)\" len=\(attempted.count)")
                 if appFlow.unlockSecretSpace(with: unlockPIN) {
                     statusMessage = nil
                     unlockPIN = ""
@@ -1129,7 +1132,15 @@ private struct SystemPINPadContainer<Content: View>: View {
                 }
             ))
             .keyboardType(.numberPad)
-            .textContentType(.oneTimeCode)
+            // Intentionally NOT `.textContentType(.oneTimeCode)`. That
+            // hint causes iOS to surface 4-digit codes from Messages /
+            // Mail / AutoFill above the keypad, and a misread tap
+            // there silently replaces the user's typed PIN with
+            // something they never intended to save. For a vault PIN
+            // we want exactly the digits the user pressed, nothing
+            // else.
+            .textContentType(.none)
+            .autocorrectionDisabled(true)
             .focused($focused)
             .frame(width: 1, height: 1)
             .opacity(0.01)
