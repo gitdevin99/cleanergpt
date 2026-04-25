@@ -26,7 +26,19 @@ struct SecretSpaceView: View {
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var pendingImportItems: [PhotosPickerItem] = []
     @State private var showImportOptions = false
-    @State private var showForgotConfirm = false
+    /// True once Face ID has confirmed the user is the device owner
+    /// during the "I forgot my PIN" recovery flow. While true the
+    /// unlock screen swaps the PIN entry pad for a NEW-PIN entry pad
+    /// (using the same `pinCreationCard` we already have, primed for
+    /// replacement instead of first-time setup). Vault contents are
+    /// not touched at any point in this path.
+    @State private var isResettingPINViaBiometrics = false
+    /// Last-resort wipe path: only offered when Face ID isn't
+    /// available / the user disabled it during creation. This is the
+    /// old destructive "Reset & Wipe Vault" alert that already
+    /// existed — kept as a fallback because there's no other identity
+    /// proof we can ask for.
+    @State private var showWipeFallbackConfirm = false
     @State private var statusMessage: String?
     @State private var previewStartIndex: Int?
     @State private var didAttemptBiometric = false
@@ -99,6 +111,12 @@ struct SecretSpaceView: View {
         ) {
             ZStack {
                 if !appFlow.hasSecretPIN {
+                    pinCreationCard
+                } else if isResettingPINViaBiometrics {
+                    // Face-ID recovery: same creation pad, primed to
+                    // replace the existing hash. `handlePINCreationStep`
+                    // routes through `replaceSecretPIN(_:)` while this
+                    // flag is set, so vault contents stay intact.
                     pinCreationCard
                 } else if !appFlow.isSecretSpaceUnlocked {
                     unlockCard
@@ -470,9 +488,7 @@ struct SecretSpaceView: View {
 
                 keyHero
 
-                Text(creationPhase == .enter
-                     ? "Create a 4-digit PIN"
-                     : "Re-enter PIN to confirm")
+                Text(pinCreationPromptText)
                     .font(CleanupFont.sectionTitle(20))
                     .foregroundStyle(.white)
                     .multilineTextAlignment(.center)
@@ -486,7 +502,7 @@ struct SecretSpaceView: View {
                         .multilineTextAlignment(.center)
                 }
 
-                if let biometric = appFlow.biometricDisplayName {
+                if !isResettingPINViaBiometrics, let biometric = appFlow.biometricDisplayName {
                     Toggle(isOn: $enableBiometricsOnCreate) {
                         HStack(spacing: 8) {
                             Image(systemName: biometric == "Face ID" ? "faceid" : "touchid")
@@ -521,12 +537,24 @@ struct SecretSpaceView: View {
             creationPhase = .confirm
         case .confirm:
             if confirmPIN == newPIN {
-                if appFlow.createSecretPIN(newPIN) {
-                    appFlow.isBiometricUnlockEnabled = enableBiometricsOnCreate && appFlow.biometricDisplayName != nil
+                // During Face-ID-backed recovery we REPLACE the hash
+                // without touching the vault directory or the items
+                // index. First-time creation still goes through
+                // `createSecretPIN(_:)` which is functionally identical
+                // for the hash but sets `isSecretSpaceUnlocked` and
+                // initialises a fresh vault state.
+                let saved = isResettingPINViaBiometrics
+                    ? appFlow.replaceSecretPIN(with: newPIN)
+                    : appFlow.createSecretPIN(newPIN)
+                if saved {
+                    if !isResettingPINViaBiometrics {
+                        appFlow.isBiometricUnlockEnabled = enableBiometricsOnCreate && appFlow.biometricDisplayName != nil
+                    }
                     newPIN = ""
                     confirmPIN = ""
                     creationPhase = .enter
                     statusMessage = nil
+                    isResettingPINViaBiometrics = false
                 } else {
                     statusMessage = "Use exactly 4 digits."
                     resetCreationState()
@@ -535,6 +563,23 @@ struct SecretSpaceView: View {
                 statusMessage = "PINs didn't match. Try again."
                 resetCreationState()
             }
+        }
+    }
+
+    /// Prompt copy for the 4-digit pad. Three states:
+    ///   • first-time setup, entering the PIN → "Create a 4-digit PIN"
+    ///   • first-time setup, confirming       → "Re-enter PIN to confirm"
+    ///   • recovery via Face ID, entering     → "Choose a new 4-digit PIN"
+    ///   • recovery via Face ID, confirming   → "Re-enter new PIN to confirm"
+    /// The vault contents are preserved through the recovery path; the
+    /// copy makes that distinction explicit so the user doesn't think
+    /// they're starting over from scratch.
+    private var pinCreationPromptText: String {
+        switch (isResettingPINViaBiometrics, creationPhase) {
+        case (false, .enter):   return "Create a 4-digit PIN"
+        case (false, .confirm): return "Re-enter PIN to confirm"
+        case (true,  .enter):   return "Choose a new 4-digit PIN"
+        case (true,  .confirm): return "Re-enter new PIN to confirm"
         }
     }
 
@@ -596,7 +641,7 @@ struct SecretSpaceView: View {
                     }
 
                     Button {
-                        showForgotConfirm = true
+                        handleForgotPINTap()
                     } label: {
                         Text("Forgot PIN?")
                             .font(CleanupFont.body(13))
@@ -612,7 +657,7 @@ struct SecretSpaceView: View {
         }
         .alert(
             "Reset Secret Space?",
-            isPresented: $showForgotConfirm
+            isPresented: $showWipeFallbackConfirm
         ) {
             Button("Cancel", role: .cancel) {}
             Button("Reset & Wipe Vault", role: .destructive) {
@@ -621,7 +666,38 @@ struct SecretSpaceView: View {
                 statusMessage = nil
             }
         } message: {
-            Text("Because the vault is encrypted locally, a forgotten PIN can't be recovered. Resetting will permanently delete every photo and video inside Secret Space and let you set a new PIN. This can't be undone.")
+            Text("Face ID isn't available on this device, so we can't verify it's you any other way. Resetting will permanently delete every photo and video inside Secret Space and let you set a new PIN. This can't be undone.")
+        }
+    }
+
+    /// Branches the "Forgot PIN?" tap based on what identity proof we
+    /// can ask for. When Face ID / Touch ID is enrolled and reachable,
+    /// scanning the device owner is enough — vault contents are
+    /// preserved and the user just picks a new PIN. When biometrics
+    /// aren't available we fall through to the destructive wipe path,
+    /// which is the only safe option since we have nothing else to
+    /// prove the requester is the owner.
+    private func handleForgotPINTap() {
+        guard appFlow.biometricDisplayName != nil else {
+            showWipeFallbackConfirm = true
+            return
+        }
+        Task {
+            let approved = await appFlow.attemptBiometricPINReset()
+            await MainActor.run {
+                if approved {
+                    unlockPIN = ""
+                    newPIN = ""
+                    confirmPIN = ""
+                    creationPhase = .enter
+                    statusMessage = nil
+                    isResettingPINViaBiometrics = true
+                }
+                // On user-cancel / failure we just stay on the unlock
+                // screen. We don't auto-fall-back to the wipe alert —
+                // that would punish the user for tapping the button by
+                // accident.
+            }
         }
     }
 

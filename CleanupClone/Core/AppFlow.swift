@@ -3179,6 +3179,55 @@ final class AppFlow: ObservableObject {
         }
     }
 
+    /// Identity-proof step for the "I forgot my PIN" recovery flow. Runs
+    /// the SAME Face ID / Touch ID policy used for unlock, but does NOT
+    /// flip `isSecretSpaceUnlocked` and does NOT mutate the stored PIN —
+    /// it just answers the question "is the device's owner present?" so
+    /// the UI can show the new-PIN entry afterwards. The actual PIN
+    /// replacement happens via `createSecretPIN(_:)` (which overwrites
+    /// the stored hash). Vault contents are preserved — we never touch
+    /// the on-disk vault directory or the items index.
+    ///
+    /// Returns `true` only if biometric authentication succeeded.
+    /// Returns `false` if biometrics aren't available, the user
+    /// cancelled, or the policy evaluation threw. Caller should fall
+    /// back to the destructive "Reset & Wipe" path when this returns
+    /// false (and it's not a user-cancel).
+    func attemptBiometricPINReset() async -> Bool {
+        guard hasSecretPIN else { return false }
+        let context = LAContext()
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
+            return false
+        }
+
+        let reason = "Reset your Secret Space PIN"
+        do {
+            return try await context.evaluatePolicy(
+                .deviceOwnerAuthenticationWithBiometrics,
+                localizedReason: reason
+            )
+        } catch {
+            return false
+        }
+    }
+
+    /// Replaces the stored PIN hash without touching the vault contents.
+    /// Used by the Face ID-backed recovery flow once biometric auth has
+    /// confirmed the device owner. NOT a substitute for
+    /// `resetSecretPIN()` — that one wipes the vault.
+    func replaceSecretPIN(with newPIN: String) -> Bool {
+        let trimmed = newPIN.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count == 4,
+              CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: trimmed))
+        else {
+            return false
+        }
+        UserDefaults.standard.set(hashedPIN(trimmed), forKey: secretPinHashKey)
+        isSecretSpaceUnlocked = true
+        return true
+    }
+
     func addSecretVaultItems(from items: [PhotosPickerItem], deleteOriginals: Bool) async -> SecretVaultImportResult {
         guard isSecretSpaceUnlocked else {
             return SecretVaultImportResult(
