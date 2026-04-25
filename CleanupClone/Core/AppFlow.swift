@@ -3077,27 +3077,20 @@ final class AppFlow: ObservableObject {
     func createSecretPIN(_ pin: String) -> Bool {
         let trimmed = pin.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count == 4, CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: trimmed)) else {
-            print("[PIN] createSecretPIN REJECTED — got \(pin.count) chars, raw=\"\(pin)\" trimmed=\"\(trimmed)\"")
             return false
         }
 
-        let hash = hashedPIN(trimmed)
-        UserDefaults.standard.set(hash, forKey: secretPinHashKey)
+        UserDefaults.standard.set(hashedPIN(trimmed), forKey: secretPinHashKey)
         isSecretSpaceUnlocked = true
-        print("[PIN] createSecretPIN OK — pin=\"\(trimmed)\" storedHashPrefix=\(hash.prefix(12))")
         return true
     }
 
     func unlockSecretSpace(with pin: String) -> Bool {
         guard let storedHash = UserDefaults.standard.string(forKey: secretPinHashKey) else {
-            print("[PIN] unlockSecretSpace called with no stored hash — pin=\"\(pin)\"")
             return false
         }
 
-        let trimmed = pin.trimmingCharacters(in: .whitespacesAndNewlines)
-        let candidateHash = hashedPIN(trimmed)
-        let isMatch = storedHash == candidateHash
-        print("[PIN] unlockSecretSpace — pin=\"\(pin)\" trimmed=\"\(trimmed)\" candidatePrefix=\(candidateHash.prefix(12)) storedPrefix=\(storedHash.prefix(12)) match=\(isMatch)")
+        let isMatch = storedHash == hashedPIN(pin)
         isSecretSpaceUnlocked = isMatch
         return isMatch
     }
@@ -3228,13 +3221,10 @@ final class AppFlow: ObservableObject {
         guard trimmed.count == 4,
               CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: trimmed))
         else {
-            print("[PIN] replaceSecretPIN REJECTED — got \(newPIN.count) chars, raw=\"\(newPIN)\"")
             return false
         }
-        let hash = hashedPIN(trimmed)
-        UserDefaults.standard.set(hash, forKey: secretPinHashKey)
+        UserDefaults.standard.set(hashedPIN(trimmed), forKey: secretPinHashKey)
         isSecretSpaceUnlocked = true
-        print("[PIN] replaceSecretPIN OK — pin=\"\(trimmed)\" storedHashPrefix=\(hash.prefix(12))")
         return true
     }
 

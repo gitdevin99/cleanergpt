@@ -571,7 +571,6 @@ struct SecretSpaceView: View {
             statusMessage = nil
             creationPhase = .confirm
         case .confirm:
-            print("[PIN-VIEW] confirm step — newPIN=\"\(newPIN)\" confirmPIN=\"\(confirmPIN)\" match=\(confirmPIN == newPIN) recoveryMode=\(isResettingPINViaBiometrics)")
             if confirmPIN == newPIN {
                 // During Face-ID-backed recovery we REPLACE the hash
                 // without touching the vault directory or the items
@@ -630,8 +629,16 @@ struct SecretSpaceView: View {
             value: $unlockPIN,
             maxLength: 4,
             onComplete: {
-                let attempted = unlockPIN
-                print("[PIN-VIEW] unlock onComplete fired — unlockPIN=\"\(attempted)\" len=\(attempted.count)")
+                // Drop double-fires. The pad schedules `onComplete`
+                // every time the TextField setter sees the value at
+                // maxLength, and on iOS 26 the system keypad
+                // occasionally emits the same value twice for one
+                // tap (probably autofill / suggestion bar plumbing).
+                // First fire opens the vault and clears unlockPIN to
+                // "" — second fire would otherwise call
+                // unlockSecretSpace(with: "") and stamp "That PIN
+                // didn't match" right after a successful unlock.
+                guard unlockPIN.count == 4 else { return }
                 if appFlow.unlockSecretSpace(with: unlockPIN) {
                     statusMessage = nil
                     unlockPIN = ""
