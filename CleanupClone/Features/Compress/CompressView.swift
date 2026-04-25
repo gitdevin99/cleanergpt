@@ -397,7 +397,13 @@ struct CompressView: View {
                     .font(CleanupFont.body(16))
                     .foregroundStyle(.white)
 
-                PrimaryCTAButton(title: deniedPath ? "Open Settings" : "Allow Photos Access") {
+                // Apple guideline 5.1.1(iv): pre-prompt CTA must be
+                // neutral ("Continue") rather than action-claim copy
+                // ("Allow Photos Access"). The "Open Settings"
+                // variant is fine because it deep-links into iOS
+                // Settings rather than triggering an in-app system
+                // permission prompt.
+                PrimaryCTAButton(title: deniedPath ? "Open Settings" : "Continue") {
                     if deniedPath {
                         appFlow.openSystemSettings()
                     } else {

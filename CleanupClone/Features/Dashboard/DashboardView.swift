@@ -266,7 +266,13 @@ struct DashboardView: View {
                     .font(CleanupFont.body(14))
                     .foregroundStyle(CleanupTheme.textSecondary)
 
-                PrimaryCTAButton(title: deniedPath ? "Open Settings" : "Allow Photos Access") {
+                // Apple guideline 5.1.1(iv): pre-prompt CTA must use
+                // neutral copy ("Continue") rather than action-claim
+                // language ("Allow Photos Access"). The "Open
+                // Settings" path is fine — it deep-links into iOS
+                // Settings rather than firing an in-app system
+                // permission prompt.
+                PrimaryCTAButton(title: deniedPath ? "Open Settings" : "Continue") {
                     if deniedPath {
                         appFlow.openSystemSettings()
                     } else {
@@ -1253,7 +1259,11 @@ struct SmartCleaningView: View {
         case .contacts:
             guard appFlow.contactsAuthorization.isReadable else {
                 return [
-                    SmartCleanRow(id: "contacts-permission", panel: .contacts, kind: .contactsPermission, title: "Allow Contacts Access", subtitle: "Scan duplicate and incomplete contact cards.", value: "", isEnabled: true, showsDivider: false, category: nil)
+                    // Guideline 5.1.1(iv): row title doubles as the
+                    // CTA label that triggers the system permission
+                    // prompt. Keep it neutral ("Continue") — the
+                    // subtitle still tells the user what we'll do.
+                    SmartCleanRow(id: "contacts-permission", panel: .contacts, kind: .contactsPermission, title: "Continue", subtitle: "Scan duplicate and incomplete contact cards.", value: "", isEnabled: true, showsDivider: false, category: nil)
                 ]
             }
 
@@ -1681,7 +1691,13 @@ struct MediaCategoryReviewView: View {
                     : "Photo access is needed to review and delete media.")
                     .font(CleanupFont.body(16))
                     .foregroundStyle(.white)
-                PrimaryCTAButton(title: deniedPath ? "Open Settings" : "Allow Photos Access") {
+                // Apple guideline 5.1.1(iv): pre-prompt CTA must use
+                // neutral copy ("Continue") rather than action-claim
+                // language ("Allow Photos Access"). The "Open
+                // Settings" path is fine — it deep-links into iOS
+                // Settings rather than firing an in-app system
+                // permission prompt.
+                PrimaryCTAButton(title: deniedPath ? "Open Settings" : "Continue") {
                     if deniedPath {
                         appFlow.openSystemSettings()
                     } else {

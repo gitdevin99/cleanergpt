@@ -99,7 +99,12 @@ private struct ContactsMainScreen: View {
                     .font(CleanupFont.body(14))
                     .foregroundStyle(CleanupTheme.textSecondary)
 
-                PrimaryCTAButton(title: "Allow Contacts Access") {
+                // Apple guideline 5.1.1(iv): the CTA leading directly
+                // into a system permission prompt must use neutral
+                // copy like "Continue", not action-claim phrases like
+                // "Allow Contacts Access". The explainer text above
+                // still tells the user what we do with access.
+                PrimaryCTAButton(title: "Continue") {
                     Task {
                         _ = await appFlow.requestContactsAccessIfNeeded()
                     }
