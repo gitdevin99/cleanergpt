@@ -547,6 +547,19 @@ struct SecretSpaceView: View {
     }
 
     private func handlePINCreationStep() {
+        // The pin pad fires this via a 0.1s `DispatchQueue` hop after
+        // the 4th digit lands. If the user tapped "Forgot PIN?" inside
+        // that 0.1s window the form will already be cleared — both
+        // `newPIN` and `confirmPIN` empty — by the time this fires.
+        // Without this guard the confirm branch below would compare
+        // "" == "" → look like a successful match → call createPIN
+        // with an empty string (which fails) → we'd land on the
+        // generic "Use exactly 4 digits" error AND keep the prior red
+        // "PINs didn't match" text on screen depending on phase. Drop
+        // stale calls on the floor: if the relevant field is empty,
+        // there's nothing to do.
+        let activeField = creationPhase == .enter ? newPIN : confirmPIN
+        guard !activeField.isEmpty else { return }
         switch creationPhase {
         case .enter:
             // Basic validation: must be 4 digits.
