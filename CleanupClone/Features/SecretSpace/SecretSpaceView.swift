@@ -518,6 +518,28 @@ struct SecretSpaceView: View {
                     .padding(.top, 4)
                 }
 
+                // "Forgot PIN?" escape hatch on the creation/confirm
+                // screen. Two cases this rescues:
+                //   1. User is stuck in the "PINs didn't match. Try
+                //      again." loop because they typed a PIN, blanked
+                //      out, typed something different on confirm, and
+                //      now can't remember the first one. Tap clears
+                //      the entry and starts over.
+                //   2. A PIN was set previously but storage got
+                //      cleared / reset (TestFlight reinstall, etc.)
+                //      and the user is seeing the creation screen by
+                //      mistake. Tap triggers the same Face-ID-backed
+                //      recovery used on the unlock screen.
+                Button {
+                    handleForgotPINTap()
+                } label: {
+                    Text("Forgot PIN?")
+                        .font(CleanupFont.body(13))
+                        .foregroundStyle(CleanupTheme.textSecondary)
+                        .underline()
+                }
+                .padding(.top, 6)
+
                 Spacer()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -670,14 +692,27 @@ struct SecretSpaceView: View {
         }
     }
 
-    /// Branches the "Forgot PIN?" tap based on what identity proof we
-    /// can ask for. When Face ID / Touch ID is enrolled and reachable,
-    /// scanning the device owner is enough — vault contents are
-    /// preserved and the user just picks a new PIN. When biometrics
-    /// aren't available we fall through to the destructive wipe path,
-    /// which is the only safe option since we have nothing else to
-    /// prove the requester is the owner.
+    /// Branches the "Forgot PIN?" tap based on what state the screen
+    /// is in:
+    ///   • No PIN saved yet AND the user is mid-creation → just clear
+    ///     the form and let them start over. There's nothing to
+    ///     "recover" because nothing's saved.
+    ///   • PIN saved + biometrics available → Face ID / Touch ID as
+    ///     identity proof, then let the user pick a new PIN. Vault
+    ///     contents preserved.
+    ///   • PIN saved + no biometrics → fall back to the destructive
+    ///     wipe alert (the only safe option without identity proof).
     private func handleForgotPINTap() {
+        // Mid-creation rescue: user got stuck in the "PINs didn't
+        // match" loop with no prior PIN saved. Clear the form so
+        // they're back at "Create a 4-digit PIN" with empty dots.
+        guard appFlow.hasSecretPIN else {
+            newPIN = ""
+            confirmPIN = ""
+            creationPhase = .enter
+            statusMessage = nil
+            return
+        }
         guard appFlow.biometricDisplayName != nil else {
             showWipeFallbackConfirm = true
             return
